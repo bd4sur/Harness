@@ -128,3 +128,89 @@ Skill 文件使用 Markdown 格式，顶部可用 `---` 包裹 YAML frontmatter�
 - 由于 `run_bash` 需要终端交互确认，在完全非交互环境运行可能会卡住。
 
 
+
+
+
+
+
+
+
+
+
+
+# 遗留问题
+
+这个请求体报 400，核心原因不是 `content: []`（那个已经修掉了），而是 **存在两条"空壳" assistant 消息**：
+
+```json
+{"role": "assistant", "content": ""}
+```
+
+请求体里出现了两次：
+1. 在 `tool_sG0z1hak...` 的 tool result 之后
+2. 在 user 说 `"你好"` 之后
+
+---
+
+### 为什么 `{"role": "assistant", "content": ""}` 会 400？
+
+OpenAI 兼容规范里，`assistant` 消息的 `content` 允许 `string` 或 `null`。但 **Kimi（`api.kimi.com`）的校验比 OpenAI 更严格**：
+
+> 当 `assistant` 消息**没有 `tool_calls`** 时，`content` 不能是空字符串 `""`。  
+> 空字符串会被服务端视为"这条消息没有任何有效信息"，直接判为格式错误。
+
+换句话说：
+- `{"role": "assistant", "content": "", "tool_calls": [...]}` → **合法**（发起工具调用时 content 为空是正常的）
+- `{"role": "assistant", "content": ""}` → **某些实现里不合法**（没有 tool_calls 又没有内容，等于白占一条消息）
+
+你的 harness 在 `build_assistant_message(text, [])` 里用了 `text or ''`，导致空文本被硬编码成 `""`。当模型某一轮什么也没输出（比如用户说 `"你好"`，模型只回了空），这条空消息被写进 session，下次请求带上它就炸了。
+
+---
+
+### 另一个助推因素：`max_tokens` 过大
+
+```json
+"max_tokens": 1048576
+```
+
+Kimi API 的上下文窗口通常只有 128K 或 256K。`max_tokens` 设成 1M 会让 `prompt_tokens + max_tokens` 的总和远超模型上限，API 也可能因此拒掉请求。错误信息通常是 `max_tokens exceeds limit` 或类似的 `invalid_request_error`。
+
+---
+
+### 修复建议
+
+**1. 空 assistant 消息的处理**
+
+把 `build_assistant_message` 里对空文本的处理改掉：
+
+```python
+# 原来
+return {'role': 'assistant', 'content': text or '', 'tool_calls': tool_calls or []}
+
+# 改为：没有 tool_calls 且没有 text 时，content 用 null 或干脆不存这条消息
+if not text and not tool_calls:
+    # 方案 A：content 设为 null（Kimi 通常接受 null）
+    return {'role': 'assistant', 'content': None}
+    # 方案 B：更保险——这种空消息不写入历史，直接跳过
+```
+
+**推荐方案 B**：如果一轮对话模型既没输出文本也没调用工具，说明这一轮是"空转"，不应该往 `context['messages']` 里 append 任何东西。
+
+**2. `max_tokens` 设个合理的上限**
+
+```python
+max_tokens=min(int(os.environ.get('HARNESS_MAX_TOKENS', '8192')), 8192)
+```
+
+或者至少不能超过常见模型的上下文窗口余量。
+
+---
+
+### 总结
+
+| 问题 | 位置 | 影响 |
+|------|------|------|
+| `content: ""` 且无 `tool_calls` | 两条 assistant 消息 | 被 Kimi API 视为无效消息，400 |
+| `max_tokens: 1048576` | 请求体顶层 | 可能触发上限校验，400 |
+
+优先修第一条，因为那是格式层面的硬伤；第二条是参数层面的问题，修完更稳健。
