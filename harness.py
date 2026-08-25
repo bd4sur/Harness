@@ -1,4 +1,7 @@
 from __future__ import annotations
+import os
+import sys
+import readline
 
 # ==========================================
 # src/llm.py
@@ -26,25 +29,46 @@ def context_to_openai_messages(context: dict) -> list[dict]:
         role = msg['role']
         content = msg['content']
 
-        if isinstance(content, str):
+        if isinstance(content, str) and role != 'assistant':
             messages.append({'role': role, 'content': content})
             continue
 
         if role == 'assistant':
             text = ''
-            tool_calls = []
+            raw_tool_calls = []
+            if isinstance(content, str):
+                # 新格式：content 直接是字符串，tool_calls 在独立字段（内部格式）
+                text = content
+                raw_tool_calls = msg.get('tool_calls', [])
+            else:
+                # 兼容旧格式：content 是 parts 数组（text / tool_use）
+                for b in content:
+                    if b['type'] == 'text': text += b['text']
+                    elif b['type'] == 'tool_use':
+                        raw_tool_calls.append({
+                            'id': b['id'], 'type': 'function',
+                            'function': {'name': b['name'], 'arguments': json.dumps(b['input'], ensure_ascii=False)}
+                        })
+            # 修复：部分 OpenAI 兼容 API 要求 assistant 消息 content 不能为空，
+            # 且带 tool_calls 时 content 必须为空字符串。
+            if raw_tool_calls:
+                # 新格式的内部 tool_calls 需要转成 OpenAI 标准格式
+                tool_calls = raw_tool_calls if raw_tool_calls[0].get('type') == 'function' else [
+                    {
+                        'id': tc['id'], 'type': 'function',
+                        'function': {'name': tc['name'], 'arguments': json.dumps(tc.get('args', {}), ensure_ascii=False)}
+                    } for tc in raw_tool_calls
+                ]
+                messages.append({'role': 'assistant', 'content': '', 'tool_calls': tool_calls})
+            else:
+                messages.append({'role': 'assistant', 'content': text or ''})
+        elif role == 'tool':
+            # 标准格式：tool result 以 role='tool' 的 block 列表保存
             for b in content:
-                if b['type'] == 'text': text += b['text']
-                elif b['type'] == 'tool_use':
-                    tool_calls.append({
-                        'id': b['id'], 'type': 'function',
-                        'function': {'name': b['name'], 'arguments': json.dumps(b['input'], ensure_ascii=False)}
-                    })
-            c = text if text else (None if tool_calls else '')
-            m = {'role': 'assistant', 'content': c}
-            if tool_calls: m['tool_calls'] = tool_calls
-            messages.append(m)
+                if b['type'] == 'tool_result':
+                    messages.append({'role': 'tool', 'tool_call_id': b['tool_use_id'], 'content': b['content']})
         else:
+            # 兼容旧格式：tool result 曾以 role='user' 的 block 列表保存
             for b in content:
                 if b['type'] == 'tool_result':
                     messages.append({'role': 'tool', 'tool_call_id': b['tool_use_id'], 'content': b['content']})
@@ -70,47 +94,62 @@ def stream(model: Model, context: dict, tools: Optional[list[dict]] = None, sign
             
             while True:
                 if signal and signal.aborted: break
-                chunk = response.read(2048)
-                if not chunk: 
-                    # 流结束，flush 解码器中可能残留的字节
-                    final = decoder.decode(b'', final=True)
-                    if final: buffer += final
-                    break
-                    
-                # 增量解码：自动处理多字节字符边界，不完整的字节会缓存在 decoder 内部
-                buffer += decoder.decode(chunk)
-                
-                while '\n' in buffer:
+
+                # 优先消费 buffer 中已有的完整 SSE 行，每次只处理一条。
+                # 原来 `while '\n' in buffer` 会一次性把 read(2048) 读到的多个事件
+                # 全部解析并连续 yield，导致 TUI 在几毫秒内被调用多次，输出看起来
+                # 就是“一大块”。改为每次只 yield 一个事件，让上层控制节奏。
+                if '\n' in buffer:
                     line, buffer = buffer.split('\n', 1)
-                    line = line.strip()
-                    if not line.startswith('data: '): continue
-                    data = line[6:]
-                    if data == '[DONE]': break
-                    
-                    try: chunk_json = json.loads(data)
-                    except json.JSONDecodeError: continue
-                    
-                    choice = chunk_json.get('choices', [{}])[0]
-                    if not choice: continue
-                    
-                    delta = choice.get('delta', {})
-                    if 'content' in delta and delta['content']:
-                        yield {'type': 'text_delta', 'delta': delta['content']}
-                        
-                    if 'tool_calls' in delta and delta['tool_calls']:
-                        for tc in delta['tool_calls']:
-                            idx = tc.get('index', 0)
-                            if idx not in tool_call_buffers:
-                                tool_call_buffers[idx] = {'id': tc.get('id', f'call_{idx}'), 'name': '', 'args_buf': ''}
-                            entry = tool_call_buffers[idx]
-                            if 'id' in tc and tc['id']: entry['id'] = tc['id']
-                            func = tc.get('function', {})
-                            if 'name' in func and func['name']: entry['name'] = func['name']
-                            if 'arguments' in func and func['arguments']: entry['args_buf'] += func['arguments']
-                            
-                    fr = choice.get('finish_reason')
-                    if fr == 'tool_calls': stop_reason = 'tool_use'
-                    elif fr == 'length': stop_reason = 'max_tokens'
+                else:
+                    # 读更小的块，避免一次吞掉多个 SSE 事件。
+                    chunk = response.read(64)
+                    if not chunk:
+                        # 流结束，flush 解码器中可能残留的字节
+                        final = decoder.decode(b'', final=True)
+                        if final: buffer += final
+                        break
+                    # 增量解码：自动处理多字节字符边界，不完整的字节会缓存在 decoder 内部
+                    buffer += decoder.decode(chunk)
+                    continue
+
+                line = line.strip()
+                if not line.startswith('data: '): continue
+                data = line[6:]
+                if data == '[DONE]': break
+
+                try: chunk_json = json.loads(data)
+                except json.JSONDecodeError: continue
+
+                choice = chunk_json.get('choices', [{}])[0]
+                if not choice: continue
+
+                delta = choice.get('delta', {})
+                if 'content' in delta and delta['content']:
+                    # 把 content delta 拆成单个字符逐个 yield，提高 TUI 回调频率，
+                    # 避免一个 delta 里包含多个词时一次性整段输出。
+                    for ch in delta['content']:
+                        yield {'type': 'text_delta', 'delta': ch}
+
+                reasoning = delta.get('reasoning_content') or delta.get('reasoning')
+                if reasoning:
+                    for ch in reasoning:
+                        yield {'type': 'reasoning_delta', 'delta': ch}
+
+                if 'tool_calls' in delta and delta['tool_calls']:
+                    for tc in delta['tool_calls']:
+                        idx = tc.get('index', 0)
+                        if idx not in tool_call_buffers:
+                            tool_call_buffers[idx] = {'id': tc.get('id', f'call_{idx}'), 'name': '', 'args_buf': ''}
+                        entry = tool_call_buffers[idx]
+                        if 'id' in tc and tc['id']: entry['id'] = tc['id']
+                        func = tc.get('function', {})
+                        if 'name' in func and func['name']: entry['name'] = func['name']
+                        if 'arguments' in func and func['arguments']: entry['args_buf'] += func['arguments']
+
+                fr = choice.get('finish_reason')
+                if fr == 'tool_calls': stop_reason = 'tool_use'
+                elif fr == 'length': stop_reason = 'max_tokens'
                     
     except KeyboardInterrupt:
         if signal: signal.aborted = True
@@ -134,14 +173,16 @@ def stream(model: Model, context: dict, tools: Optional[list[dict]] = None, sign
     yield {'type': 'done', 'stop_reason': 'aborted' if (signal and signal.aborted) else stop_reason}
 
 def build_assistant_message(text: str, tool_calls: list[dict]) -> dict:
-    content = []
-    if text: content.append({'type': 'text', 'text': text})
-    for tc in tool_calls:
-        content.append({'type': 'tool_use', 'id': tc['id'], 'name': tc['name'], 'input': tc['args']})
-    return {'role': 'assistant', 'content': content}
+    # 修复：避免返回 content: []，统一使用简单结构，保证 content 始终为字符串。
+    # 本地保留完整 text；发送给 API 前，context_to_openai_messages 会按 OpenAI 规范
+    # 把带 tool_calls 的 assistant 消息的 content 置空。
+    msg = {'role': 'assistant', 'content': text or ''}
+    if tool_calls:
+        msg['tool_calls'] = tool_calls
+    return msg
 
 def build_tool_result_message(results: list[dict]) -> dict:
-    return {'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': r['tool_use_id'], 'content': r['content']} for r in results]}
+    return {'role': 'tool', 'content': [{'type': 'tool_result', 'tool_use_id': r['tool_use_id'], 'content': r['content']} for r in results]}
 
 
 # ==========================================
@@ -168,6 +209,22 @@ def compact_context(model: Model, context: dict, signal: Any = None):
 
     old_msgs = context['messages'][:-KEEP_RECENT]
     recent_msgs = context['messages'][-KEEP_RECENT:]
+
+    # 修复：截断后如果 recent_msgs 以 tool 消息开头，其对应的 assistant/tool_calls
+    # 可能被摘要到 user summary 中，导致 OpenAI 兼容 API 报 400（tool 消息前必须
+    # 紧跟产生它的 assistant）。向前扩展，把对应的 assistant 一并包含进来。
+    while recent_msgs and recent_msgs[0].get('role') == 'tool':
+        idx = len(old_msgs) - 1
+        while idx >= 0 and old_msgs[idx].get('role') != 'assistant':
+            idx -= 1
+        if idx < 0:
+            # 找不到对应的 assistant，丢弃这条孤立的 tool 消息
+            recent_msgs = recent_msgs[1:]
+            continue
+        recent_msgs = old_msgs[idx:] + recent_msgs
+        old_msgs = old_msgs[:idx]
+        break
+
     conv_text = '\n'.join([f"{m['role']}: {json.dumps(m['content'], ensure_ascii=False) if isinstance(m['content'], list) else m['content']}" for m in old_msgs])
 
     summary_ctx = {
@@ -197,6 +254,8 @@ def run_agent(model: Model, context: dict, tools: list[AgentTool], signal: Any =
                 if ev['type'] == 'text_delta':
                     text += ev['delta']
                     yield {'type': 'assistant_text', 'delta': ev['delta']}
+                elif ev['type'] == 'reasoning_delta':
+                    yield {'type': 'reasoning_text', 'delta': ev['delta']}
                 elif ev['type'] == 'tool_call':
                     tool_calls.append({'id': ev['id'], 'name': ev['name'], 'args': ev['args']})
                     yield {'type': 'tool_call', 'id': ev['id'], 'name': ev['name'], 'args': ev['args']}
@@ -261,6 +320,7 @@ def run_agent(model: Model, context: dict, tools: list[AgentTool], signal: Any =
 # ==========================================
 import os
 import subprocess
+import sys
 import tempfile
 from typing import Any
 
@@ -297,8 +357,15 @@ def _edit(args: dict, signal: Any = None) -> str:
     return f'edited {path}: replaced {len(old_str)} chars'
 
 def _run_bash(args: dict, signal: Any = None) -> str:
+    cmd = args['command']
+    # 强制用户确认，直接回车确认，Ctrl+C 取消
     try:
-        res = subprocess.run(args['command'], shell=True, capture_output=True, text=True, timeout=30)
+        confirm = input(f'[run_bash confirm] {cmd}\n执行该命令？直接回车确认，Ctrl+C 取消 >>> ')
+    except KeyboardInterrupt:
+        if signal: signal.aborted = True
+        return 'aborted by user'
+    try:
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
         output = f'[stderr] {res.stderr}\n[stdout] {res.stdout}' if res.stderr else res.stdout
         return truncate_output(output)
     except subprocess.TimeoutExpired: return 'error: command timed out'
@@ -340,7 +407,20 @@ import sys
 import json
 
 class Tui:
+    def __init__(self):
+        self.in_reasoning = False
+
     def print_text(self, delta: str):
+        if self.in_reasoning:
+            sys.stdout.write(']')
+            self.in_reasoning = False
+        sys.stdout.write(delta)
+        sys.stdout.flush()
+
+    def print_reasoning(self, delta: str):
+        if not self.in_reasoning:
+            sys.stdout.write('[Thinking: ')
+            self.in_reasoning = True
         sys.stdout.write(delta)
         sys.stdout.flush()
 
@@ -349,7 +429,8 @@ class Tui:
         sys.stdout.flush()
 
     def print_tool_result(self, name: str, result: str):
-        sys.stdout.write(f'[result: {name}] {result}\n')
+        # sys.stdout.write(f'[result: {name}] {result}\n')
+        sys.stdout.write(f'[result: {name}] Finished\n')
         sys.stdout.flush()
 
     def print_turn_end(self):
@@ -456,10 +537,56 @@ import os
 import sys
 import json
 import time
+import getpass
+import platform
+import socket
+from datetime import datetime
 
 SESSION_DIR = os.path.join(os.getcwd(), 'sessions')
 SESSION_FILE = os.path.join(SESSION_DIR, f'session_{int(time.time() * 1000)}.jsonl')
-SYSTEM_PROMPT = f"你是一个编码助手。用提供的工具读写文件和执行命令来完成任务。先阅读再修改，修改后可运行命令验证。你的工作目录是：{os.getcwd()}/\n"
+SYSTEM_PROMPT = f"""你是一个严谨的本地编码助手。
+
+当前环境信息：
+- 当前日期时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}（本地时间）
+- 当前工作目录：{os.getcwd()}/
+- 操作系统：{platform.system()} {platform.release()} ({platform.machine()})
+- Python 版本：{platform.python_version()}
+- 主机名：{socket.gethostname()}
+- 当前用户：{getpass.getuser()}
+- HARNESS_MODEL：{os.environ.get('HARNESS_MODEL', '未设置，使用默认值 deepseek-v4-flash-0731')}
+- HARNESS_BASE_URL：{os.environ.get('HARNESS_BASE_URL', '未设置，使用默认值 http://192.168.10.50:8888/v1')}
+- HARNESS_MAX_TOKENS：{os.environ.get('HARNESS_MAX_TOKENS', '未设置，使用默认值 1048576')}
+
+你的目标：通过工具与用户协作，高质量完成代码相关任务。
+
+核心工作流（必须遵守）：
+1. 先读：修改任何文件前，先用 read_file 读取目标文件和相关上下文。
+2. 再计划：简要说明你要做什么、分几步、每步改什么。
+3. 最小修改：优先使用 edit 做精确文本替换；只有新建文件或必须整体重写时，才使用 write_file。
+4. 后验证：修改完成后，必须运行相关命令（测试、编译、lint、运行脚本等）验证结果。
+5. 汇报：用一句话总结本回合做了什么、验证结果如何。
+
+工具使用规范：
+- read_file：读取文件内容，大文件会自动截断最后 200 行。需要更多上下文时可指定具体范围（但目前不支持行号，可读取后自己分析）。
+- edit：old_string 必须在文件中唯一存在，替换前请在心里核对 old_string 与文件内容是否完全匹配。
+- write_file：会覆盖原文件，使用前先确认目标不存在或用户明确要求覆盖。
+- run_bash：执行 shell 命令，执行前工具会要求用户确认；请一次性给出正确的命令，避免交互式命令（如 vim、top）。
+
+错误处理：
+- 如果 edit 报错 old_string 不匹配，先重新 read_file 确认内容，再修正 old_string 重试。
+- 如果 run_bash 返回错误，先分析 stderr，判断是命令问题、环境问题还是预期内错误，再决定下一步。
+- 不要连续多次用同样的参数重试同一工具。
+
+输出风格：
+- 对用户的回复简洁、结构化，避免长篇大论。
+- 思考过程可以用 [Thinking: ...] 展示，但对外输出要聚焦在行动和结果上。
+- 每轮结束时，用一句话总结当前进度。
+
+安全边界：
+- 不主动删除用户文件。
+- 不执行可能破坏工作目录的命令（rm -rf、重定向覆盖关键文件等）。
+- 需要覆盖或删除时，先征得用户同意。
+"""
 
 class Signal:
     def __init__(self): self.aborted = False
@@ -475,16 +602,16 @@ def load_session() -> list[dict]:
     return messages
 
 def main():
-    api_key = os.environ.get('NANOPI_API_KEY')
+    api_key = os.environ.get('HARNESS_API_KEY')
     if not api_key:
-        print('未设置 NANOPI_API_KEY 环境变量，默认为空（通过 export NANOPI_API_KEY=xxx 设置）', file=sys.stderr)
-        api_key = "sk-dummykey"
+        print('未设置 HARNESS_API_KEY 环境变量，默认为空（通过 export HARNESS_API_KEY=xxx 设置）', file=sys.stderr)
+        api_key = "sk-0"
 
     model = Model(
         api_key=api_key,
-        model=os.environ.get('NANOPI_MODEL', 'deepseek-v4-flash-0731'),
-        base_url=os.environ.get('NANOPI_BASE_URL', 'http://192.168.10.50:8888/v1'),
-        max_tokens=4096
+        model=os.environ.get('HARNESS_MODEL', 'deepseek-v4-flash-0731'),
+        base_url=os.environ.get('HARNESS_BASE_URL', 'http://192.168.10.50:8888/v1'),
+        max_tokens=int(os.environ.get('HARNESS_MAX_TOKENS', '1048576'))
     )
 
     context = {'system_prompt': SYSTEM_PROMPT, 'messages': load_session()}
@@ -493,19 +620,36 @@ def main():
     ui = Tui()
 
     print("Agent 已启动 (输入 Ctrl+C 可随时中断当前任务，连续两次 Ctrl+C 退出程序)")
+    print("多行输入以空行结束；空行本身不会保留。")
     while True:
         try:
-            text = input('> ').strip()
+            first_line = input('> ').rstrip('\n')
         except (EOFError, KeyboardInterrupt):
             print('\nBye!')
             break
 
-        if not text: continue
+        if not first_line.strip():
+            continue
 
         # 斜杠指令：本地处理，不发给模型，也不会写进对话历史
-        result = handle_command(text, context)
+        result = handle_command(first_line, context)
         if result is not None:
             if result: print(result)
+            continue
+
+        # 多行输入：空行结束。后续行用 ': ' 提示。
+        lines = [first_line]
+        while True:
+            try:
+                line = input(': ').rstrip('\n')
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not line.strip():
+                break
+            lines.append(line)
+
+        text = '\n'.join(lines).strip()
+        if not text:
             continue
 
         context['messages'].append({'role': 'user', 'content': text})
@@ -514,6 +658,7 @@ def main():
         try:
             for ev in run_agent(model, context, tools_list, signal):
                 if ev['type'] == 'assistant_text': ui.print_text(ev['delta'])
+                elif ev['type'] == 'reasoning_text': ui.print_reasoning(ev['delta'])
                 elif ev['type'] == 'tool_call': ui.print_tool_call(ev['name'], ev['args'])
                 elif ev['type'] == 'tool_result': ui.print_tool_result(ev['name'], ev['result'])
                 elif ev['type'] == 'turn_end':
