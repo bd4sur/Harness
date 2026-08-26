@@ -10,6 +10,7 @@ import readline
 import json
 import codecs
 import urllib.request
+import urllib.error
 from typing import Any, Generator, Optional
 from dataclasses import dataclass
 
@@ -51,6 +52,10 @@ def context_to_openai_messages(context: dict) -> list[dict]:
                         })
             # 修复：部分 OpenAI 兼容 API 要求 assistant 消息 content 不能为空，
             # 且带 tool_calls 时 content 必须为空字符串。
+            # 修复：跳过完全空的 assistant 消息（无内容且无 tool_calls），避免某些
+            # OpenAI 兼容 API（如 Kimi）将 content="" 且无 tool_calls 的消息视为无效。
+            if not raw_tool_calls and not text:
+                continue
             if raw_tool_calls:
                 # 新格式的内部 tool_calls 需要转成 OpenAI 标准格式
                 tool_calls = raw_tool_calls if raw_tool_calls[0].get('type') == 'function' else [
@@ -61,7 +66,7 @@ def context_to_openai_messages(context: dict) -> list[dict]:
                 ]
                 messages.append({'role': 'assistant', 'content': '', 'tool_calls': tool_calls})
             else:
-                messages.append({'role': 'assistant', 'content': text or ''})
+                messages.append({'role': 'assistant', 'content': text})
         elif role == 'tool':
             # 标准格式：tool result 以 role='tool' 的 block 列表保存
             for b in content:
@@ -155,6 +160,13 @@ def stream(model: Model, context: dict, tools: Optional[list[dict]] = None, sign
         if signal: signal.aborted = True
         yield {'type': 'done', 'stop_reason': 'aborted'}
         return
+    except urllib.error.HTTPError as e:
+        # HTTP 错误（如 400）时，原样打印服务端返回的错误响应体
+        try: err_body = e.read().decode('utf-8', 'ignore')
+        except Exception: err_body = str(e)
+        print(f'\n[http response error] {err_body}')
+        yield {'type': 'error', 'error': f'HTTP {e.code}: {err_body}'}
+        return
     except Exception as e:
         if signal and signal.aborted:
             yield {'type': 'done', 'stop_reason': 'aborted'}
@@ -172,11 +184,15 @@ def stream(model: Model, context: dict, tools: Optional[list[dict]] = None, sign
 
     yield {'type': 'done', 'stop_reason': 'aborted' if (signal and signal.aborted) else stop_reason}
 
-def build_assistant_message(text: str, tool_calls: list[dict]) -> dict:
-    # 修复：避免返回 content: []，统一使用简单结构，保证 content 始终为字符串。
-    # 本地保留完整 text；发送给 API 前，context_to_openai_messages 会按 OpenAI 规范
-    # 把带 tool_calls 的 assistant 消息的 content 置空。
-    msg = {'role': 'assistant', 'content': text or ''}
+def build_assistant_message(text: str, tool_calls: list[dict]) -> Optional[dict]:
+    # 修复：避免返回 content: []，统一使用简单结构。
+    # 当没有文本且没有 tool_calls 时，返回 None，调用方应跳过这条空消息，
+    # 避免某些 OpenAI 兼容 API（如 Kimi）把 content="" 且无 tool_calls 的
+    # assistant 消息视为无效格式而报 400。
+    text = text or ''
+    if not text and not tool_calls:
+        return None
+    msg = {'role': 'assistant', 'content': text}
     if tool_calls:
         msg['tool_calls'] = tool_calls
     return msg
@@ -262,21 +278,25 @@ def run_agent(model: Model, context: dict, tools: list[AgentTool], signal: Any =
                 elif ev['type'] == 'done':
                     stop_reason = ev['stop_reason']
                     if stop_reason == 'aborted':
-                        context['messages'].append(build_assistant_message(text, []))
+                        msg = build_assistant_message(text, [])
+                        if msg: context['messages'].append(msg)
                         yield {'type': 'turn_end', 'stop_reason': 'aborted'}
                         return
                 elif ev['type'] == 'error':
-                    context['messages'].append(build_assistant_message(text, []))
+                    msg = build_assistant_message(text, [])
+                    if msg: context['messages'].append(msg)
                     yield {'type': 'assistant_text', 'delta': f"\n[error] {ev['error']}"}
                     yield {'type': 'turn_end', 'stop_reason': 'error'}
                     return
         except KeyboardInterrupt:
             if signal: signal.aborted = True
-            context['messages'].append(build_assistant_message(text, []))
+            msg = build_assistant_message(text, [])
+            if msg: context['messages'].append(msg)
             yield {'type': 'turn_end', 'stop_reason': 'aborted'}
             return
 
-        context['messages'].append(build_assistant_message(text, tool_calls))
+        msg = build_assistant_message(text, tool_calls)
+        if msg: context['messages'].append(msg)
 
         if stop_reason == 'max_tokens' and tool_calls:
             results = [{'tool_use_id': tc['id'], 'content': f'error: output truncated by max_tokens, tool "{tc["name"]}" args may be incomplete.'} for tc in tool_calls]
@@ -324,7 +344,7 @@ import sys
 import tempfile
 from typing import Any
 
-MAX_OUTPUT_LINES = 200
+MAX_OUTPUT_LINES = 5000
 _truncate_counter = 0
 
 def truncate_output(content: str, max_lines: int = MAX_OUTPUT_LINES) -> str:
@@ -360,7 +380,7 @@ def _run_bash(args: dict, signal: Any = None) -> str:
     cmd = args['command']
     # 强制用户确认，直接回车确认，Ctrl+C 取消
     try:
-        confirm = input(f'[run_bash confirm] {cmd}\n执行该命令？直接回车确认，Ctrl+C 取消 >>> ')
+        confirm = input(f'\033[1;31m[run_bash confirm] {cmd}\033[0m\n\033[1;31m执行该命令？直接回车确认，Ctrl+C 取消\033[0m >>> ')
     except KeyboardInterrupt:
         if signal: signal.aborted = True
         return 'aborted by user'
@@ -407,33 +427,44 @@ import sys
 import json
 
 class Tui:
+    # ANSI 样式：斜体青色用于思考过程，黄色用于工具调用信息，重置用于恢复默认。
+    REASONING_STYLE = '\033[3;36m'
+    TOOL_STYLE = '\033[1;33m'
+    RESET = '\033[0m'
+
     def __init__(self):
         self.in_reasoning = False
 
-    def print_text(self, delta: str):
+    def _end_reasoning(self):
         if self.in_reasoning:
-            sys.stdout.write(']')
+            sys.stdout.write(f']\n{self.RESET}')
             self.in_reasoning = False
+
+    def print_text(self, delta: str):
+        self._end_reasoning()
         sys.stdout.write(delta)
         sys.stdout.flush()
 
     def print_reasoning(self, delta: str):
         if not self.in_reasoning:
-            sys.stdout.write('[Thinking: ')
+            sys.stdout.write(f'{self.REASONING_STYLE}[Thinking: ')
             self.in_reasoning = True
         sys.stdout.write(delta)
         sys.stdout.flush()
 
     def print_tool_call(self, name: str, args: dict):
-        sys.stdout.write(f'\n[tool: {name}] {json.dumps(args, ensure_ascii=False)}\n')
+        self._end_reasoning()
+        sys.stdout.write(f'{self.TOOL_STYLE}\n[tool: {name}] {json.dumps(args, ensure_ascii=False)}\n{self.RESET}')
         sys.stdout.flush()
 
     def print_tool_result(self, name: str, result: str):
-        # sys.stdout.write(f'[result: {name}] {result}\n')
-        sys.stdout.write(f'[result: {name}] Finished\n')
+        self._end_reasoning()
+        # sys.stdout.write(f'{self.TOOL_STYLE}[result: {name}] {result}\n{self.RESET}')
+        sys.stdout.write(f'{self.TOOL_STYLE}[result: {name}] Finished\n{self.RESET}')
         sys.stdout.flush()
 
     def print_turn_end(self):
+        self._end_reasoning()
         sys.stdout.write('\n')
         sys.stdout.flush()
 
@@ -567,7 +598,7 @@ SYSTEM_PROMPT = f"""你是一个严谨的本地编码助手。
 5. 汇报：用一句话总结本回合做了什么、验证结果如何。
 
 工具使用规范：
-- read_file：读取文件内容，大文件会自动截断最后 200 行。需要更多上下文时可指定具体范围（但目前不支持行号，可读取后自己分析）。
+- read_file：读取文件内容，大文件会自动截断最后若干行。需要更多上下文时可指定具体范围（但目前不支持行号，可读取后自己分析）。
 - edit：old_string 必须在文件中唯一存在，替换前请在心里核对 old_string 与文件内容是否完全匹配。
 - write_file：会覆盖原文件，使用前先确认目标不存在或用户明确要求覆盖。
 - run_bash：执行 shell 命令，执行前工具会要求用户确认；请一次性给出正确的命令，避免交互式命令（如 vim、top）。
@@ -611,7 +642,7 @@ def main():
         api_key=api_key,
         model=os.environ.get('HARNESS_MODEL', 'deepseek-v4-flash-0731'),
         base_url=os.environ.get('HARNESS_BASE_URL', 'http://192.168.10.50:8888/v1'),
-        max_tokens=int(os.environ.get('HARNESS_MAX_TOKENS', '1048576'))
+        max_tokens=int(os.environ.get('HARNESS_MAX_TOKENS', '65536'))
     )
 
     context = {'system_prompt': SYSTEM_PROMPT, 'messages': load_session()}
@@ -677,4 +708,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
