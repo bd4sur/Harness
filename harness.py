@@ -1,16 +1,11 @@
 from __future__ import annotations
-import os
-import sys
-import readline
+import os, sys, readline
 
 # ==========================================
 # src/llm.py
 # 统一 LLM API —— 把 OpenAI Completions SSE 响应解析成四种事件流。只支持 OpenAI 兼容格式。
 # ==========================================
-import json
-import codecs
-import urllib.request
-import urllib.error
+import json, codecs, urllib.request, urllib.error
 from typing import Any, Generator, Optional
 from dataclasses import dataclass
 
@@ -36,58 +31,28 @@ def context_to_openai_messages(context: dict) -> list[dict]:
         role = msg['role']
         content = msg['content']
 
-        if isinstance(content, str) and role != 'assistant':
-            messages.append({'role': role, 'content': content})
-            continue
-
-        if role == 'assistant':
-            text = ''
-            raw_tool_calls = []
-            if isinstance(content, str):
-                # 新格式：content 直接是字符串，tool_calls 在独立字段（内部格式）
-                text = content
-                raw_tool_calls = msg.get('tool_calls', [])
-            else:
-                # 兼容旧格式：content 是 parts 数组（text / tool_use）
-                for b in content:
-                    if b['type'] == 'text': text += b['text']
-                    elif b['type'] == 'tool_use':
-                        raw_tool_calls.append({
-                            'id': b['id'], 'type': 'function',
-                            'function': {'name': b['name'], 'arguments': json.dumps(b['input'], ensure_ascii=False)}
-                        })
-            # 修复：部分 OpenAI 兼容 API 要求 assistant 消息 content 不能为空，
-            # 且带 tool_calls 时 content 必须为空字符串。
-            # 修复：跳过完全空的 assistant 消息（无内容且无 tool_calls），避免某些
-            # OpenAI 兼容 API（如 Kimi）将 content="" 且无 tool_calls 的消息视为无效。
-            if not raw_tool_calls and not text:
+        if role == 'user':
+            messages.append({'role': 'user', 'content': content})
+        elif role == 'assistant':
+            # 内部格式：content 是字符串，tool_calls 在独立字段（{id, name, args}）
+            text = content
+            raw_tool_calls = msg.get('tool_calls') or []
+            if not raw_tool_calls and not text:      # 空 assistant 消息会被 Kimi 判非法，见 AGENTS.md
                 continue
-            out = {'role': 'assistant', 'content': text}
+            out = {'role': 'assistant', 'content': '' if raw_tool_calls else text}
             if raw_tool_calls:
-                # 新格式的内部 tool_calls 需要转成 OpenAI 标准格式
-                out['content'] = ''
-                out['tool_calls'] = raw_tool_calls if raw_tool_calls[0].get('type') == 'function' else [
-                    {
-                        'id': tc['id'], 'type': 'function',
-                        'function': {'name': tc['name'], 'arguments': json.dumps(tc.get('args', {}), ensure_ascii=False)}
-                    } for tc in raw_tool_calls
-                ]
+                # 内部 tool_calls 转成 OpenAI 标准格式
+                out['tool_calls'] = [{
+                    'id': tc['id'], 'type': 'function',
+                    'function': {'name': tc['name'], 'arguments': json.dumps(tc.get('args', {}), ensure_ascii=False)}
+                } for tc in raw_tool_calls]
             # thinking 模型需要把上一轮的思考过程原样带回去（见 REASONING_ECHO）
             if msg.get('reasoning_content'):
                 out['reasoning_content'] = msg['reasoning_content']
             messages.append(out)
-        elif role == 'tool':
-            # 标准格式：tool result 以 role='tool' 的 block 列表保存
+        else:  # role == 'tool'：content 是 tool_result 块列表
             for b in content:
-                if b['type'] == 'tool_result':
-                    messages.append({'role': 'tool', 'tool_call_id': b['tool_use_id'], 'content': b['content']})
-        else:
-            # 兼容旧格式：tool result 曾以 role='user' 的 block 列表保存
-            for b in content:
-                if b['type'] == 'tool_result':
-                    messages.append({'role': 'tool', 'tool_call_id': b['tool_use_id'], 'content': b['content']})
-                elif b['type'] == 'text':
-                    messages.append({'role': 'user', 'content': b['text']})
+                messages.append({'role': 'tool', 'tool_call_id': b['tool_use_id'], 'content': b['content']})
     return messages
 
 def stream(model: Model, context: dict, tools: Optional[list[dict]] = None, signal: Any = None) -> Generator[dict, None, None]:
@@ -107,7 +72,10 @@ def stream(model: Model, context: dict, tools: Optional[list[dict]] = None, sign
             decoder = codecs.getincrementaldecoder('utf-8')('ignore')
             
             while True:
-                if signal and signal.aborted: break
+                # 用户中断：直接收摊，不再把缓冲区里读了一半的 tool_calls 当完整调用抛出去
+                if signal and signal.aborted:
+                    yield {'type': 'done', 'stop_reason': 'aborted'}
+                    return
 
                 # 优先消费 buffer 中已有的完整 SSE 行，每次只处理一条。
                 # 原来 `while '\n' in buffer` 会一次性把 read(2048) 读到的多个事件
@@ -174,18 +142,17 @@ def stream(model: Model, context: dict, tools: Optional[list[dict]] = None, sign
         if signal: signal.aborted = True
         yield {'type': 'done', 'stop_reason': 'aborted'}
         return
-    except urllib.error.HTTPError as e:
-        # HTTP 错误（如 400）时，原样打印服务端返回的错误响应体
-        try: err_body = e.read().decode('utf-8', 'ignore')
-        except Exception: err_body = str(e)
-        print(f'\n[http response error] {err_body}')
-        yield {'type': 'error', 'error': f'HTTP {e.code}: {err_body}'}
-        return
     except Exception as e:
         if signal and signal.aborted:
             yield {'type': 'done', 'stop_reason': 'aborted'}
             return
-        yield {'type': 'error', 'error': str(e)}
+        # HTTP 错误（如 400）时，原样打印服务端返回的错误响应体
+        detail = ''
+        if isinstance(e, urllib.error.HTTPError):
+            try: detail = e.read().decode('utf-8', 'ignore')
+            except Exception: detail = str(e)
+            print(f'\n[http response error] {detail}')
+        yield {'type': 'error', 'error': f'HTTP {e.code}: {detail}' if detail else str(e)}
         return
 
     for idx in sorted(tool_call_buffers.keys()):
@@ -199,12 +166,8 @@ def stream(model: Model, context: dict, tools: Optional[list[dict]] = None, sign
     yield {'type': 'done', 'stop_reason': 'aborted' if (signal and signal.aborted) else stop_reason}
 
 def build_assistant_message(text: str, tool_calls: list[dict], reasoning: str = '') -> Optional[dict]:
-    # 修复：避免返回 content: []，统一使用简单结构。
-    # 当没有文本且没有 tool_calls 时，返回 None，调用方应跳过这条空消息，
-    # 避免某些 OpenAI 兼容 API（如 Kimi）把 content="" 且无 tool_calls 的
-    # assistant 消息视为无效格式而报 400。
     text = text or ''
-    if not text and not tool_calls:
+    if not text and not tool_calls:      # 空转轮次不写进历史，见 AGENTS.md「已知坑」
         return None
     msg = {'role': 'assistant', 'content': text}
     if tool_calls:
@@ -247,9 +210,7 @@ def compact_context(model: Model, context: dict, signal: Any = None, before_requ
     old_msgs = context['messages'][:-KEEP_RECENT]
     recent_msgs = context['messages'][-KEEP_RECENT:]
 
-    # 修复：截断后如果 recent_msgs 以 tool 消息开头，其对应的 assistant/tool_calls
-    # 可能被摘要到 user summary 中，导致 OpenAI 兼容 API 报 400（tool 消息前必须
-    # 紧跟产生它的 assistant）。向前扩展，把对应的 assistant 一并包含进来。
+    # 摘要可能连发起 tool 的 assistant 一起摘掉，保留段以 tool 开头就缺了它（见 AGENTS.md）
     while recent_msgs and recent_msgs[0].get('role') == 'tool':
         idx = len(old_msgs) - 1
         while idx >= 0 and old_msgs[idx].get('role') != 'assistant':
@@ -287,7 +248,8 @@ def compact_context(model: Model, context: dict, signal: Any = None, before_requ
             'dropped': len(old_msgs),
             'kept': len(recent_msgs),
             'messages': [dict(m) for m in new_messages],
-            'summary_request': json.loads(json.dumps(summary_ctx, ensure_ascii=False)),
+            'summary_request': {'system_prompt': summary_ctx['system_prompt'],
+                                'messages': [dict(summary_ctx['messages'][0])]},
         }
     return None
 
@@ -308,36 +270,30 @@ def run_agent(model: Model, context: dict, tools: list[AgentTool], signal: Any =
             yield {'type': 'context_compacted', **compact_info}
         text, reasoning, stop_reason, tool_calls = '', '', 'end_turn', []
 
-        try:
-            if before_request: before_request(context)   # 发请求前先把上下文写入 session
-            for ev in stream(model, context, tools=tool_defs, signal=signal):
-                if ev['type'] == 'text_delta':
-                    text += ev['delta']
-                    yield {'type': 'assistant_text', 'delta': ev['delta']}
-                elif ev['type'] == 'reasoning_delta':
-                    reasoning += ev['delta']            # 累起来，用于回传给 thinking 模型
-                    yield {'type': 'reasoning_text', 'delta': ev['delta']}
-                elif ev['type'] == 'usage':
-                    yield {'type': 'usage', 'usage': ev['usage']}
-                elif ev['type'] == 'tool_call':
-                    tool_calls.append({'id': ev['id'], 'name': ev['name'], 'args': ev['args']})
-                    yield {'type': 'tool_call', 'id': ev['id'], 'name': ev['name'], 'args': ev['args']}
-                elif ev['type'] == 'done':
-                    stop_reason = ev['stop_reason']
-                    if stop_reason == 'aborted':
-                        _append_assistant(context, text, [], reasoning)
-                        yield {'type': 'turn_end', 'stop_reason': 'aborted'}
-                        return
-                elif ev['type'] == 'error':
+        if before_request: before_request(context)   # 发请求前先把上下文写入 session
+        for ev in stream(model, context, tools=tool_defs, signal=signal):
+            if ev['type'] == 'text_delta':
+                text += ev['delta']
+                yield {'type': 'assistant_text', 'delta': ev['delta']}
+            elif ev['type'] == 'reasoning_delta':
+                reasoning += ev['delta']            # 累起来，用于回传给 thinking 模型
+                yield {'type': 'reasoning_text', 'delta': ev['delta']}
+            elif ev['type'] == 'usage':
+                yield {'type': 'usage', 'usage': ev['usage']}
+            elif ev['type'] == 'tool_call':
+                tool_calls.append({'id': ev['id'], 'name': ev['name'], 'args': ev['args']})
+                yield {'type': 'tool_call', 'id': ev['id'], 'name': ev['name'], 'args': ev['args']}
+            elif ev['type'] == 'done':
+                stop_reason = ev['stop_reason']
+                if stop_reason == 'aborted':
                     _append_assistant(context, text, [], reasoning)
-                    yield {'type': 'assistant_text', 'delta': f"\n[error] {ev['error']}"}
-                    yield {'type': 'turn_end', 'stop_reason': 'error'}
+                    yield {'type': 'turn_end', 'stop_reason': 'aborted'}
                     return
-        except KeyboardInterrupt:
-            if signal: signal.aborted = True
-            _append_assistant(context, text, [], reasoning)
-            yield {'type': 'turn_end', 'stop_reason': 'aborted'}
-            return
+            elif ev['type'] == 'error':
+                _append_assistant(context, text, [], reasoning)
+                yield {'type': 'assistant_text', 'delta': f"\n[error] {ev['error']}"}
+                yield {'type': 'turn_end', 'stop_reason': 'error'}
+                return
 
         _append_assistant(context, text, tool_calls, reasoning)
 
@@ -381,11 +337,7 @@ def run_agent(model: Model, context: dict, tools: list[AgentTool], signal: Any =
 # src/tools.py
 # 4 个内置工具 —— 能读写改代码并执行验证的最小集。
 # ==========================================
-import os
-import hashlib
-import subprocess
-import sys
-import tempfile
+import os, hashlib, subprocess, tempfile
 from typing import Any
 
 MAX_OUTPUT_LINES = 5000
@@ -438,37 +390,26 @@ def _run_bash(args: dict, signal: Any = None) -> str:
         return 'aborted'
     except Exception as e: return f'[error] {str(e)}'
 
+TOOL_SPECS = [      # (name, description, parameters, execute) —— 一个工具一条
+    ('read_file', '读取文件内容。参数：path（文件路径）。超长文件只返回末尾 5000 行，并给出完整内容的临时文件路径。',
+     {'type': 'object', 'properties': {'path': {'type': 'string'}}, 'required': ['path']}, _read_file),
+    ('write_file', '写入文件（覆盖）。参数：path（路径）、content（内容）',
+     {'type': 'object', 'properties': {'path': {'type': 'string'}, 'content': {'type': 'string'}}, 'required': ['path', 'content']}, _write_file),
+    ('edit', '编辑文件：精确替换一段文本。参数：path、old_string、new_string。old_string 必须在文件中唯一匹配，否则报错。',
+     {'type': 'object', 'properties': {'path': {'type': 'string'}, 'old_string': {'type': 'string'}, 'new_string': {'type': 'string'}}, 'required': ['path', 'old_string', 'new_string']}, _edit),
+    ('run_bash', '执行 shell 命令。参数：command（命令字符串）。返回 stdout+stderr，超长输出只保留末尾 5000 行并给出临时文件路径。',
+     {'type': 'object', 'properties': {'command': {'type': 'string'}}, 'required': ['command']}, _run_bash),
+]
+
 def builtin_tools() -> list[AgentTool]:
-    return [
-        AgentTool(
-            'read_file',
-            '读取文件内容。参数：path（文件路径）。超长文件只返回末尾 5000 行，并给出完整内容的临时文件路径。',
-            {'type': 'object', 'properties': {'path': {'type': 'string'}}, 'required': ['path']},
-            _read_file),
-        AgentTool(
-            'write_file',
-            '写入文件（覆盖）。参数：path（路径）、content（内容）',
-            {'type': 'object', 'properties': {'path': {'type': 'string'}, 'content': {'type': 'string'}}, 'required': ['path', 'content']},
-            _write_file),
-        AgentTool(
-            'edit',
-            '编辑文件：精确替换一段文本。参数：path、old_string、new_string。old_string 必须在文件中唯一匹配，否则报错。',
-            {'type': 'object', 'properties': {'path': {'type': 'string'}, 'old_string': {'type': 'string'}, 'new_string': {'type': 'string'}}, 'required': ['path', 'old_string', 'new_string']},
-            _edit),
-        AgentTool(
-            'run_bash',
-            '执行 shell 命令。参数：command（命令字符串）。返回 stdout+stderr，超长输出只保留末尾 5000 行并给出临时文件路径。',
-            {'type': 'object', 'properties': {'command': {'type': 'string'}}, 'required': ['command']},
-            _run_bash)
-    ]
+    return [AgentTool(*spec) for spec in TOOL_SPECS]
 
 
 # ==========================================
 # src/tui.py
 # 极简终端界面 —— 单行输入 + 流式输出 + Ctrl+C 打断。
 # ==========================================
-import sys
-import json
+import sys, json
 
 class Tui:
     # ANSI 样式：斜体青色用于思考过程，黄色用于工具调用信息，重置用于恢复默认。
@@ -476,6 +417,15 @@ class Tui:
     TOOL_STYLE = '\033[1;33m'
     NOTICE_STYLE = '\033[2m'
     RESET = '\033[0m'
+    # 单行渲染表：kind → (渲染函数, 样式)。text / result / turn_end / notice / tool_call
+    # 一律走 print()，不再每种写一个只做转发的 def。
+    LINE = {
+        'text':      (lambda s: s, ''),
+        'result':    (lambda name: f'[result: {name}] Finished\n', TOOL_STYLE),
+        'turn_end':  (lambda: '\n', ''),
+        'notice':    (lambda s: f'{s}\n', NOTICE_STYLE),
+        'tool_call': (lambda name, args: f'\n[tool: {name}] {json.dumps(args, ensure_ascii=False)}\n', TOOL_STYLE),
+    }
 
     def __init__(self):
         self.in_reasoning = False
@@ -485,55 +435,52 @@ class Tui:
             sys.stdout.write(f']\n{self.RESET}')
             self.in_reasoning = False
 
-    def _out(self, text: str, style: str = ''):
-        """非思考输出的唯一出口：先关掉思考块，再写一段并 flush。"""
+    def print(self, kind: str, *args):
+        """非思考输出的唯一出口：先关掉思考块，再按 LINE 表渲染并 flush。"""
         self._end_reasoning()
-        sys.stdout.write(f'{style}{text}{self.RESET if style else ""}')
+        render, style = self.LINE[kind]
+        sys.stdout.write(f'{style}{render(*args)}{self.RESET if style else ""}')
         sys.stdout.flush()
 
-    def print_text(self, delta: str):
-        self._out(delta)
-
     def print_reasoning(self, delta: str):
-        # 思考块内部不走 _out（那会提前关掉思考块），风格在开头挂一次
+        # 思考块内部不走 print（那会提前关掉思考块），风格在开头挂一次
         if not self.in_reasoning:
             sys.stdout.write(f'{self.REASONING_STYLE}[Thinking: ')
             self.in_reasoning = True
         sys.stdout.write(delta)
         sys.stdout.flush()
 
-    def print_tool_call(self, name: str, args: dict):
-        self._out(f'\n[tool: {name}] {json.dumps(args, ensure_ascii=False)}\n', self.TOOL_STYLE)
-
-    def print_tool_result(self, name: str):
-        self._out(f'[result: {name}] Finished\n', self.TOOL_STYLE)
-
-    def print_turn_end(self):
-        self._out('\n')
-
-    def print_notice(self, text: str):
-        self._out(f'{text}\n', self.NOTICE_STYLE)
-
     def print_usage(self, usage: dict):
         """一行缓存命中率：命中数 / prompt 总数，便于判断前缀缓存有没有生效。"""
         prompt = usage.get('prompt_tokens') or 0
         hit = cached_tokens(usage)
         ratio = f'{hit * 100 // prompt}%' if prompt else '-'
-        self.print_notice(f"[cache {ratio}] {hit}/{prompt} prompt tokens reused")
+        self.print('notice', f"[cache {ratio}] {hit}/{prompt} prompt tokens reused")
 
 
 # ==========================================
 # src/cli.py
 # 拼装层 —— 把 llm / agent / tui / tools 粘起来，是唯一入口。
 # ==========================================
-import os
-import sys
-import json
-import time
+import os, sys, json, time
 from datetime import datetime
 
 SESSION_DIR = os.path.join(os.getcwd(), 'sessions')
-SESSION_FILE = os.path.join(SESSION_DIR, f'session_{int(time.time() * 1000)}.jsonl')
+
+def _new_session_file() -> str:
+    return os.path.join(SESSION_DIR, f'session_{int(time.time() * 1000)}.jsonl')
+
+def _pick_session_file() -> str:
+    """HARNESS_SESSION 显式指定 > sessions/ 里最新的一份（续接）> 新建时间戳文件；=none 强制新开。"""
+    explicit = os.environ.get('HARNESS_SESSION', '')
+    if explicit: return _new_session_file() if explicit == 'none' else explicit
+    if os.path.isdir(SESSION_DIR):
+        history = sorted((f for f in os.listdir(SESSION_DIR) if f.startswith('session_') and f.endswith('.jsonl')),
+                         key=lambda f: os.path.getmtime(os.path.join(SESSION_DIR, f)))
+        if history: return os.path.join(SESSION_DIR, history[-1])
+    return _new_session_file()
+
+SESSION_FILE = _pick_session_file()
 # 注意：系统提示词必须是常量，不能含时间、路径、主机名等每次启动都会变的内容。
 # 服务端前缀缓存按“逐 token 相同的前缀”命中，头部一变整段缓存全废；
 # 需要环境信息时让模型自己调 run_bash 去查（见下方“环境信息”）。
@@ -583,14 +530,11 @@ SYSTEM_PROMPT = """你是一个严谨的本地编码助手。
 class Signal:
     def __init__(self): self.aborted = False
 
-def load_session() -> list[dict]:
-    """从 session jsonl 重建消息列表（供续接历史用）。
-
-    记录类型见下方注释：普通消息按顺序追加，snapshot 记录表示上下文重写（压缩）需要整份替换。
-    """
-    if not os.path.exists(SESSION_FILE): return []
+def load_session(path: str = SESSION_FILE) -> list[dict]:
+    """按记录类型折叠 session jsonl 重建 messages：消息追加、snapshot 整份替换、残缺尾巴丢弃。"""
+    if not os.path.exists(path): return []
     messages: list[dict] = []
-    with open(SESSION_FILE, 'r', encoding='utf-8') as f:
+    with open(path, 'r', encoding='utf-8') as f:
         for line in f:
             line = line.strip()
             if not line: continue
@@ -602,6 +546,11 @@ def load_session() -> list[dict]:
             elif rec.get('type') == 'snapshot':    # 上下文重写点：整份替换
                 messages = rec.get('messages', [])
             # meta / system_prompt / usage 等记录仅用于审计，不参与上下文重建
+    # 崩溃/强杀可能把文件停在“assistant 已发起 tool_calls、结果还没落盘”的位置；
+    # 这种残缺尾巴会让 OpenAI 兼容 API 报 400，续接时把 tool 结果连同发起者一起丢弃。
+    while messages and (messages[-1].get('role') == 'tool'
+                        or (messages[-1].get('role') == 'assistant' and messages[-1].get('tool_calls'))):
+        messages.pop()
     return messages
 
 # session jsonl 记录类型（每行一个 JSON 对象）：
@@ -617,9 +566,11 @@ def load_session() -> list[dict]:
 class SessionLog:
     """负责把内存里的 context 完整、增量地写进 session jsonl。"""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, restored: Optional[list[dict]] = None):
         self.path = path
-        self.message_cursor = 0      # context['messages'] 中已落盘的前缀长度
+        # context['messages'] 中已落盘的前缀长度。续接时先扣掉恢复出来的部分，
+        # 否则第一次 sync 会把已落盘的历史再追加一遍，下次续接就读重了。
+        self.message_cursor = len(restored or [])
 
     def append(self, record: dict):
         os.makedirs(os.path.dirname(self.path) or '.', exist_ok=True)
@@ -679,10 +630,12 @@ def main():
     context = {'system_prompt': SYSTEM_PROMPT, 'messages': restored_messages}
     tools_list = builtin_tools()
     ui = Tui()
-    log = SessionLog(SESSION_FILE)
+    log = SessionLog(SESSION_FILE, restored_messages)
     log.start(model, tools_list, context)   # 先把 meta / system prompt 落盘，再发任何请求
     flush_context = log.sync                # 每次调用模型前先落盘，保证 jsonl 不缺上下文
 
+    if restored_messages: print(f"续接会话 {SESSION_FILE}（恢复 {len(restored_messages)} 条消息）")
+    else: print(f"新建会话 {SESSION_FILE}")
     print("Agent 已启动 (输入 Ctrl+C 可随时中断当前任务，连续两次 Ctrl+C 退出程序)")
     print("多行输入以空行结束；空行本身不会保留。")
     while True:
@@ -716,14 +669,14 @@ def main():
         signal = Signal()
         try:
             for ev in run_agent(model, context, tools_list, signal, before_request=flush_context):
-                if ev['type'] == 'assistant_text': ui.print_text(ev['delta'])
+                if ev['type'] == 'assistant_text': ui.print('text', ev['delta'])
                 elif ev['type'] == 'reasoning_text': ui.print_reasoning(ev['delta'])
-                elif ev['type'] == 'tool_call': ui.print_tool_call(ev['name'], ev['args'])
-                elif ev['type'] == 'tool_result': ui.print_tool_result(ev['name'])
+                elif ev['type'] == 'tool_call': ui.print('tool_call', ev['name'], ev['args'])
+                elif ev['type'] == 'tool_result': ui.print('result', ev['name'])
                 elif ev['type'] == 'context_compacted':
                     # 压缩重写了 messages，立刻写一份完整快照（含摘要请求原文）
                     log.on_compaction(ev)
-                    ui.print_notice(f"[context compacted] dropped {ev['dropped']} messages, kept {ev['kept']}")
+                    ui.print('notice', f"[context compacted] dropped {ev['dropped']} messages, kept {ev['kept']}")
                 elif ev['type'] == 'usage':
                     # 缓存观测：命中率接近 0 说明前缀被破坏（典型：系统提示词含时间戳、刚压缩完）
                     usage = ev['usage']
@@ -732,9 +685,9 @@ def main():
                                 'cached_tokens': cached_tokens(usage),
                                 'completion_tokens': usage.get('completion_tokens')})
                 elif ev['type'] == 'turn_end':
-                    if ev['stop_reason'] == 'max_tokens': ui.print_text('\n[output truncated by max_tokens]')
-                    if ev['stop_reason'] == 'error': ui.print_text('\n[error occurred]')
-                    ui.print_turn_end()
+                    if ev['stop_reason'] == 'max_tokens': ui.print('text', '\n[output truncated by max_tokens]')
+                    if ev['stop_reason'] == 'error': ui.print('text', '\n[error occurred]')
+                    ui.print('turn_end')
         except KeyboardInterrupt:
             signal.aborted = True
             print('\n[aborted by user]')

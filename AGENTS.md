@@ -39,6 +39,7 @@ python harness.py
 | `HARNESS_MODEL` | 模型名称 | `deepseek-v4-flash-0731` |
 | `HARNESS_BASE_URL` | OpenAI 兼容 API 的基础 URL | `http://192.168.10.50:8888/v1` |
 | `HARNESS_MAX_TOKENS` | 每次请求的最大生成 token 数 | `1048576` |
+| `HARNESS_SESSION` | 会话文件路径。不设则续接 `sessions/` 里最新的一份（不存在则新建）；设为 `none` 强制新开会话；设为某个路径则读写该文件 | 续接最新 |
 | `HARNESS_REASONING_ECHO` | 思考过程回传策略：`off` / `tool_calls` / `all`。DeepSeek 的 thinking 模型在工具续写时、Kimi 的保留式思考在多轮对话时都要求把 `reasoning_content` 原样放回 assistant 消息，否则报 400 或推理链断裂 | `tool_calls` |
 
 示例：
@@ -64,8 +65,10 @@ Harness 只提供 4 个最基础的工具，覆盖“读、写、改、验证”
 
 ## 会话与上下文
 
-- 每次启动时，Harness 会加载最近生成的 `sessions/session_*.jsonl` 文件（如果存在），作为初始历史。
-- 新的对话会增量追加到同一个会话文件中。
+- 每次启动时，Harness 会加载最近生成的 `sessions/session_*.jsonl` 文件（如果存在），作为初始历史；`HARNESS_SESSION` 可指定别的路径或强制新开会话。
+- 新的对话会增量追加到同一个会话文件中；续接时 `SessionLog` 的增量游标从已恢复的消息数起算，历史不会被重复写第二遍。
+- 续接不会破坏前缀缓存：系统提示词是常量，`reasoning_content` 也随 assistant 消息一起存盘，因此恢复出来的历史与上次实际发出的请求逐 token 相同。
+- 如果上次是被强杀/崩溃结束的，文件可能停在「`assistant` 已发起 `tool_calls`、工具结果还没落盘」的位置，`load_session` 会把这段残缺尾巴丢掉，避免 OpenAI 兼容 API 报 400。
 - 当历史消息数超过 `COMPACT_THRESHOLD`（默认 50 条）时，Agent 会调用一次 LLM 对早期对话做摘要，仅保留最近的 `KEEP_RECENT`（默认 20 条）原始消息，从而控制上下文长度。
 - 摘要时如果保留的最近消息以 `tool` 结果开头，`compact_context` 会向前扩展，把产生该 tool 的 `assistant` 消息一并保留，避免 OpenAI 兼容 API 因 tool 消息前缺少对应 `tool_calls` 而报 400。
 
@@ -105,16 +108,16 @@ Harness 只提供 4 个最基础的工具，覆盖“读、写、改、验证”
    - 触发上下文压缩。
 
 3. **工具层（`src/tools.py`）**
-   - 定义 `AgentTool` 数据结构并实现 4 个内置工具。
+   - `AgentTool` 数据结构 + 一张 `TOOL_SPECS` 表（`name, description, parameters, execute` 四元组）驱动 4 个内置工具；`builtin_tools()` 只是把表拼成 `AgentTool` 列表。新增工具只改表。
    - 命令输出超过 5000 行时，会写入临时文件并只返回末尾内容；临时文件按**内容哈希**命名（不是 pid/序号），保证同样的输出得到同样的工具结果字符串，跨会话也能复用前缀缓存。
 
 4. **CLI/TUI 层（`src/cli.py` + `src/tui.py`）**
-   - `Tui` 负责把流式事件渲染到终端，包括普通文本、推理文本（显示为 `[思考: ...]`）、工具调用与结果。
+   - `Tui` 负责把流式事件渲染到终端。所有“一整行”的输出（`text` / `result` / `turn_end` / `notice` / `tool_call`）都走同一个 `print(kind, *args)`，具体格式在那张 `LINE` 表里；只有推理文本（`print_reasoning`，带 `[Thinking: ...]` 状态机）和 `print_usage` 因为有自己的状态/计算而单独存在。
    - `cli.py` 是程序入口，负责配置模型、加载会话、启动交互循环。
 
 ## 扩展与开发建议
 
-- **增加工具**：在 `builtin_tools()` 中新增 `AgentTool(name, description, parameters, execute)`，并在工具描述里说明参数。
+- **增加工具**：在 `TOOL_SPECS` 表里加一条 `(name, description, parameters, execute)`，并在 description 里说明参数；不需要改 `builtin_tools()` 或 agent 循环。
 - **修改提示词**：调整 `cli.py` 中的 `SYSTEM_PROMPT`。它必须保持为**常量**：不能写入时间、`cwd`、主机名等每次启动都会变的内容，否则服务端前缀缓存从 system 开头就失效；需要环境信息时，让模型自己用 `run_bash` 去查（提示词里已经列出了对应的命令）。
 - **改前缀缓存策略**：消息只能**追加**，不能修改已发出的历史（唯一合法例外是压缩）；压缩（`snapshot`）会把缓存从头废掉，所以 `COMPACT_THRESHOLD` 不要设得太小。命中率看每回合的 `[cache N%]` 输出或 session 里的 `usage` 记录。
 - **调试 API 问题**：可以先通过 `curl` 直接测试 `HARNESS_BASE_URL` 是否支持 OpenAI 兼容的 `/chat/completions` 流式接口。
@@ -124,6 +127,32 @@ Harness 只提供 4 个最基础的工具，覆盖“读、写、改、验证”
 - 本项目仅支持 OpenAI 兼容的流式 Chat Completions 接口。
 - 模型API 端点需要正确处理 SSE 流、`finish_reason` 以及 `tool_calls` 增量字段。
 - 由于 `run_bash` 需要终端交互确认，在完全非交互环境运行可能会卡住。
+
+## 已知坑（代码里只留一行指针，详情在这里）
+
+这四条是“删了就一定出问题”的硬约束，每一条都是对具体 API 行为踩过坑之后的产物：
+
+1. **assistant 消息的 `content` 与空消息**
+   - 带 `tool_calls` 时 `content` 必须是空字符串 `""`（`context_to_openai_messages`）。
+   - 既没有 `text` 也没有 `tool_calls` 的 assistant 消息**不要写入历史**（`build_assistant_message` 返回 `None`）。Kimi（`api.kimi.com`）会把 `{"role":"assistant","content":""}` 判成非法格式直接 400；详见文末「遗留问题」。
+   - 空转轮次（模型什么都没输出）不 append 任何消息。
+
+2. **tool 消息前面必须有产生它的 assistant**
+   - OpenAI 兼容 API 要求每个 `role=tool` 紧跟带对应 `tool_calls` 的 assistant。
+   - 压缩时如果“保留的最近 KEEP_RECENT 条”以 `tool` 开头，`compact_context` 必须向前扩展，把发起它的 assistant 一起保下来，否则下一次请求 400。
+   - 中断（abort）时也要给未执行的 tool_call 补一条 `error: aborted` 结果，保证 `tool_calls` 与 tool 结果一一对应。
+
+3. **续接会话时的残缺尾巴**
+   - 落盘顺序是 user →（请求前 sync）→ assistant(tool_calls) → 执行工具 → tool 结果。若在工具执行期间被 kill，文件就停在“assistant 有 tool_calls 但没有 tool 结果”的位置，`load_session` 必须把这段尾巴整段丢掉（连同发起它的 assistant）。
+   - 续接后 `SessionLog` 的增量游标必须从已恢复的消息数起算，否则历史会被重复追加一遍。
+
+4. **前缀缓存的三条前提**（命中率看 `[cache N%]`）
+   - 系统提示词必须是常量，不能含时间、`cwd`、主机名；要环境信息就让模型自己 `run_bash` 去查。
+   - 历史只能追加；`reasoning_content` 回传永远拼在历史末尾（`HARNESS_REASONING_ECHO`），不改已有前缀。
+   - 工具结果字符串必须确定性：截断输出按**内容哈希**命名临时文件，而不是 pid/序号，否则同一段输出每次都是新字符串，跨会话缓存永远无法复用。
+
+5. **`tool_calls` 是流式增量拼接的**
+   - `stream` 把同一个 `index` 的 `function.arguments` 片段累加后再 `json.loads`；中断时不能把缓冲区里读了一半的 args 当成完整调用抛给 agent（会在工具里执行半截命令）。
 
 
 
