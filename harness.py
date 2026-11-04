@@ -291,6 +291,11 @@ def compact_context(model: Model, context: dict, signal: Any = None, before_requ
         }
     return None
 
+def _append_assistant(context: dict, text: str, tool_calls: list[dict], reasoning: str = ''):
+    """构建 assistant 消息并追加进 context；空消息（既无文本也无 tool_calls）自动跳过。"""
+    msg = build_assistant_message(text, tool_calls, reasoning)
+    if msg: context['messages'].append(msg)
+
 def run_agent(model: Model, context: dict, tools: list[AgentTool], signal: Any = None, before_request: Any = None) -> Generator[dict, None, None]:
     """before_request：每次真正调用模型前回调一次，用于把上下文落盘（保证 jsonl 不缺内容）。"""
     tool_map = {t.name: t for t in tools}
@@ -320,52 +325,48 @@ def run_agent(model: Model, context: dict, tools: list[AgentTool], signal: Any =
                 elif ev['type'] == 'done':
                     stop_reason = ev['stop_reason']
                     if stop_reason == 'aborted':
-                        msg = build_assistant_message(text, [], reasoning)
-                        if msg: context['messages'].append(msg)
+                        _append_assistant(context, text, [], reasoning)
                         yield {'type': 'turn_end', 'stop_reason': 'aborted'}
                         return
                 elif ev['type'] == 'error':
-                    msg = build_assistant_message(text, [], reasoning)
-                    if msg: context['messages'].append(msg)
+                    _append_assistant(context, text, [], reasoning)
                     yield {'type': 'assistant_text', 'delta': f"\n[error] {ev['error']}"}
                     yield {'type': 'turn_end', 'stop_reason': 'error'}
                     return
         except KeyboardInterrupt:
             if signal: signal.aborted = True
-            msg = build_assistant_message(text, [], reasoning)
-            if msg: context['messages'].append(msg)
+            _append_assistant(context, text, [], reasoning)
             yield {'type': 'turn_end', 'stop_reason': 'aborted'}
             return
 
-        msg = build_assistant_message(text, tool_calls, reasoning)
-        if msg: context['messages'].append(msg)
-
-        if stop_reason == 'max_tokens' and tool_calls:
-            results = [{'tool_use_id': tc['id'], 'content': f'error: output truncated by max_tokens, tool "{tc["name"]}" args may be incomplete.'} for tc in tool_calls]
-            context['messages'].append(build_tool_result_message(results))
-            for i, tc in enumerate(tool_calls):
-                yield {'type': 'tool_result', 'id': tc['id'], 'name': tc['name'], 'result': results[i]['content']}
-            continue
+        _append_assistant(context, text, tool_calls, reasoning)
 
         if not tool_calls:
             yield {'type': 'turn_end', 'stop_reason': 'end_turn' if stop_reason == 'tool_use' else stop_reason}
             return
 
+        # 工具结果统一在这里构造：max_tokens 截断与正常执行只差 content 从哪来，
+        # 收集完 results 后只 append 一次、只上报一遍，不再分两条路径。
+        truncated = stop_reason == 'max_tokens'
         results = []
         for tc in tool_calls:
-            tool = tool_map.get(tc['name'])
-            if not tool: res = f'error: tool "{tc["name"]}" not found'
+            if truncated:
+                res = f'error: output truncated by max_tokens, tool "{tc["name"]}" args may be incomplete.'
             else:
-                try: res = tool.execute(tc['args'], signal)
-                except KeyboardInterrupt:
-                    if signal: signal.aborted = True
-                    res = 'error: aborted'
-                except Exception as e: res = f'error: {str(e)}'
-            
+                tool = tool_map.get(tc['name'])
+                if not tool: res = f'error: tool "{tc["name"]}" not found'
+                else:
+                    try: res = tool.execute(tc['args'], signal)
+                    except KeyboardInterrupt:
+                        if signal: signal.aborted = True
+                        res = 'error: aborted'
+                    except Exception as e: res = f'error: {str(e)}'
+
             results.append({'tool_use_id': tc['id'], 'content': res})
             yield {'type': 'tool_result', 'id': tc['id'], 'name': tc['name'], 'result': res}
             if signal and signal.aborted: break
 
+        # 中断时补上未执行的 tool_call，保证 tool_calls 与 tool 结果一一对应
         for tc in tool_calls[len(results):]:
             results.append({'tool_use_id': tc['id'], 'content': 'error: aborted'})
             yield {'type': 'tool_result', 'id': tc['id'], 'name': tc['name'], 'result': 'error: aborted'}
@@ -484,12 +485,17 @@ class Tui:
             sys.stdout.write(f']\n{self.RESET}')
             self.in_reasoning = False
 
-    def print_text(self, delta: str):
+    def _out(self, text: str, style: str = ''):
+        """非思考输出的唯一出口：先关掉思考块，再写一段并 flush。"""
         self._end_reasoning()
-        sys.stdout.write(delta)
+        sys.stdout.write(f'{style}{text}{self.RESET if style else ""}')
         sys.stdout.flush()
 
+    def print_text(self, delta: str):
+        self._out(delta)
+
     def print_reasoning(self, delta: str):
+        # 思考块内部不走 _out（那会提前关掉思考块），风格在开头挂一次
         if not self.in_reasoning:
             sys.stdout.write(f'{self.REASONING_STYLE}[Thinking: ')
             self.in_reasoning = True
@@ -497,25 +503,16 @@ class Tui:
         sys.stdout.flush()
 
     def print_tool_call(self, name: str, args: dict):
-        self._end_reasoning()
-        sys.stdout.write(f'{self.TOOL_STYLE}\n[tool: {name}] {json.dumps(args, ensure_ascii=False)}\n{self.RESET}')
-        sys.stdout.flush()
+        self._out(f'\n[tool: {name}] {json.dumps(args, ensure_ascii=False)}\n', self.TOOL_STYLE)
 
-    def print_tool_result(self, name: str, result: str):
-        self._end_reasoning()
-        # sys.stdout.write(f'{self.TOOL_STYLE}[result: {name}] {result}\n{self.RESET}')
-        sys.stdout.write(f'{self.TOOL_STYLE}[result: {name}] Finished\n{self.RESET}')
-        sys.stdout.flush()
+    def print_tool_result(self, name: str):
+        self._out(f'[result: {name}] Finished\n', self.TOOL_STYLE)
 
     def print_turn_end(self):
-        self._end_reasoning()
-        sys.stdout.write('\n')
-        sys.stdout.flush()
+        self._out('\n')
 
     def print_notice(self, text: str):
-        self._end_reasoning()
-        sys.stdout.write(f'{self.NOTICE_STYLE}{text}\n{self.RESET}')
-        sys.stdout.flush()
+        self._out(f'{text}\n', self.NOTICE_STYLE)
 
     def print_usage(self, usage: dict):
         """一行缓存命中率：命中数 / prompt 总数，便于判断前缀缓存有没有生效。"""
@@ -523,97 +520,6 @@ class Tui:
         hit = cached_tokens(usage)
         ratio = f'{hit * 100 // prompt}%' if prompt else '-'
         self.print_notice(f"[cache {ratio}] {hit}/{prompt} prompt tokens reused")
-
-
-# ==========================================
-# src/commands.py
-# 斜杠指令 —— 以 / 开头的输入在此本地解析，不会作为普通对话发给模型。
-# 通过注册表扩展：新增内置指令只需向 builtin_commands() 注册一个 handler。
-# 未注册的指令名默认当作 skill 名，读取 skills/<name>.md 拼进 system_prompt。
-# ==========================================
-import os
-import re
-from typing import Callable, Optional
-
-SKILLS_DIR = os.path.join(os.getcwd(), 'skills')
-
-def parse_command(text: str) -> Optional[tuple[str, str]]:
-    """把 /name args 解析成 (name, args)；不是指令返回 None。"""
-    if not text.startswith('/'):
-        return None
-    parts = text[1:].split(None, 1)
-    name = parts[0].lower() if parts else ''
-    args = parts[1] if len(parts) > 1 else ''
-    return name, args
-
-def _safe_skill_path(name: str) -> str:
-    """把 skill 名规整为 skills 目录下的安全路径，防止路径逃逸。"""
-    if not name: raise ValueError('skill 名为空')
-    base = os.path.basename(name)
-    if base != name or base in ('.', '..'):
-        raise ValueError(f'非法 skill 名: {name}')
-    return os.path.join(SKILLS_DIR, base + '.md')
-
-def _strip_frontmatter(content: str) -> str:
-    """去掉 markdown 顶部由 --- 包裹的 frontmatter。"""
-    if content.startswith('---'):
-        m = re.match(r'^---\s*\n.*?\n---\s*\n?', content, re.DOTALL)
-        if m: return content[m.end():]
-    return content
-
-def _load_skill(name: str, context: dict) -> str:
-    path = _safe_skill_path(name)
-    if not os.path.exists(path):
-        raise FileNotFoundError(f'skill 不存在: {name} (期望 {path})')
-    with open(path, 'r', encoding='utf-8') as f: content = f.read()
-    skill_text = _strip_frontmatter(content).strip()
-    context['system_prompt'] = context.get('system_prompt', '') + \
-        f"\n\n---- skill: {name} ----\n{skill_text}\n---- end skill: {name} ----"
-    return f'已加载 skill "{name}" 并拼接到 system prompt。'
-
-def _cmd_help(args: str, context: dict) -> str:
-    return '\n'.join([
-        '可用斜杠指令（以 / 开头）：',
-        '  /help         显示本帮助',
-        '  /skills       列出 skills 目录下可用的 skill',
-        '  /skill <name> 显式加载 skills/<name>.md 到 system prompt',
-        '  /<name>       未注册指令默认当作 skill 名，等价于 /skill <name>',
-    ])
-
-def _cmd_skills(args: str, context: dict) -> str:
-    if not os.path.isdir(SKILLS_DIR):
-        return 'skills 目录不存在'
-    names = sorted(f[:-3] for f in os.listdir(SKILLS_DIR) if f.endswith('.md'))
-    return '可用 skills: ' + (', '.join(names) if names else '(无)')
-
-def _cmd_skill(args: str, context: dict) -> str:
-    name = args.strip()
-    if not name:
-        return '用法: /skill <name> —— 加载 skills/<name>.md'
-    return _load_skill(name, context)
-
-def builtin_commands() -> dict[str, Callable[[str, dict], str]]:
-    return {
-        'help': _cmd_help,
-        'skills': _cmd_skills,
-        'skill': _cmd_skill,
-    }
-
-def handle_command(text: str, context: dict) -> Optional[str]:
-    """处理斜杠指令。是指令则执行并返回展示文本，否则返回 None。"""
-    parsed = parse_command(text)
-    if parsed is None: return None
-    name, args = parsed
-    if not name: return _cmd_help(args, context)     # 裸 "/" 显示帮助
-    handlers = builtin_commands()
-    if name in handlers:                      # 已注册的内置指令优先
-        return handlers[name](args, context)
-    try:                                      # 未注册的当作 skill 名
-        return _load_skill(name, context)
-    except FileNotFoundError:
-        return f'未知指令或 skill 不存在: /{name}\n提示: 输入 /help 查看可用指令，/skills 查看可用 skills。'
-    except ValueError as e:
-        return str(e)
 
 
 # ==========================================
@@ -677,15 +583,13 @@ SYSTEM_PROMPT = """你是一个严谨的本地编码助手。
 class Signal:
     def __init__(self): self.aborted = False
 
-def load_session() -> tuple[list[dict], Optional[str]]:
-    """从 session jsonl 重建上下文。
+def load_session() -> list[dict]:
+    """从 session jsonl 重建消息列表（供续接历史用）。
 
-    返回 (messages, system_prompt)。记录类型见下方 SessionLog 的说明：
-    普通消息按顺序追加，snapshot 记录表示上下文重写（压缩）需要整份替换。
+    记录类型见下方注释：普通消息按顺序追加，snapshot 记录表示上下文重写（压缩）需要整份替换。
     """
-    if not os.path.exists(SESSION_FILE): return [], None
+    if not os.path.exists(SESSION_FILE): return []
     messages: list[dict] = []
-    system_prompt = None
     with open(SESSION_FILE, 'r', encoding='utf-8') as f:
         for line in f:
             line = line.strip()
@@ -697,17 +601,16 @@ def load_session() -> tuple[list[dict], Optional[str]]:
                 messages.append(rec)
             elif rec.get('type') == 'snapshot':    # 上下文重写点：整份替换
                 messages = rec.get('messages', [])
-            elif rec.get('type') == 'system_prompt':
-                system_prompt = rec.get('content')
-            # meta 等记录仅用于审计，不参与上下文重建
-    return messages, system_prompt
+            # meta / system_prompt / usage 等记录仅用于审计，不参与上下文重建
+    return messages
 
 # session jsonl 记录类型（每行一个 JSON 对象）：
 #   {"role": ...}                                   普通消息，与发给模型的 message 一一对应
 #   {"type": "meta", ...}                            请求的固定部分：模型名 / base_url / max_tokens / 工具 schema
-#   {"type": "system_prompt", "content": ...}       完整系统提示词；每次变化（如 /skill）都重新写一份全文
+#   {"type": "system_prompt", "content": ...}       完整系统提示词（启动时写一份全文）
 #   {"type": "snapshot", "messages": [...]}         上下文被重写（压缩）后的完整消息列表
 #   {"type": "snapshot", "summary_request": ...}    压缩时额外发给模型的摘要请求，也一并留痕
+#   {"type": "usage", ...}                          每次请求的 token 用量与缓存命中
 # 原则：凡是发给模型的上下文（system、messages、tools、max_tokens）都必须能在本文件里找到，
 #      按行读回的顺序即真实上下文顺序。
 
@@ -717,7 +620,6 @@ class SessionLog:
     def __init__(self, path: str):
         self.path = path
         self.message_cursor = 0      # context['messages'] 中已落盘的前缀长度
-        self.system_prompt = None    # 已落盘的系统提示词
 
     def append(self, record: dict):
         os.makedirs(os.path.dirname(self.path) or '.', exist_ok=True)
@@ -735,21 +637,9 @@ class SessionLog:
             'stream': True,
             'tools': [{'name': t.name, 'description': t.description, 'parameters': t.parameters} for t in tools],
         })
-        self.sync_system_prompt(context)
-
-    def sync_system_prompt(self, context: dict):
-        """系统提示词有变动（初始化、/skill 追加）就写一份完整全文。"""
-        prompt = context.get('system_prompt') or ''
-        if prompt and prompt != self.system_prompt:
-            self.system_prompt = prompt
-            self.append({'type': 'system_prompt', 'content': prompt})
+        self.append({'type': 'system_prompt', 'content': context['system_prompt']})
 
     def sync(self, context: dict):
-        """把当前 context 完整刷到文件（系统提示词 + 新增消息）。"""
-        self.sync_system_prompt(context)
-        self.sync_messages(context)
-
-    def sync_messages(self, context: dict):
         """把新增的消息追加到文件；若发现上下文被意外重写则整份快照。"""
         messages = context['messages']
         if len(messages) < self.message_cursor:
@@ -785,8 +675,8 @@ def main():
         max_tokens=int(os.environ.get('HARNESS_MAX_TOKENS', '65536'))
     )
 
-    restored_messages, restored_prompt = load_session()
-    context = {'system_prompt': restored_prompt or SYSTEM_PROMPT, 'messages': restored_messages}
+    restored_messages = load_session()
+    context = {'system_prompt': SYSTEM_PROMPT, 'messages': restored_messages}
     tools_list = builtin_tools()
     ui = Tui()
     log = SessionLog(SESSION_FILE)
@@ -805,14 +695,6 @@ def main():
         if not first_line.strip():
             continue
 
-        # 斜杠指令：本地处理，不发给模型，也不会写进对话历史
-        result = handle_command(first_line, context)
-        if result is not None:
-            if result: print(result)
-            # /skill 会改动系统提示词，改动同样属于“发给模型的上下文”，必须落盘
-            log.sync_system_prompt(context)
-            continue
-
         # 多行输入：空行结束。后续行用 ': ' 提示。
         lines = [first_line]
         while True:
@@ -829,7 +711,7 @@ def main():
             continue
 
         context['messages'].append({'role': 'user', 'content': text})
-        log.sync_messages(context)   # 先把 user 消息落盘，避免中途崩掉时上下文缺尾巴
+        log.sync(context)   # 先把 user 消息落盘，避免中途崩掉时上下文缺尾巴
 
         signal = Signal()
         try:
@@ -837,7 +719,7 @@ def main():
                 if ev['type'] == 'assistant_text': ui.print_text(ev['delta'])
                 elif ev['type'] == 'reasoning_text': ui.print_reasoning(ev['delta'])
                 elif ev['type'] == 'tool_call': ui.print_tool_call(ev['name'], ev['args'])
-                elif ev['type'] == 'tool_result': ui.print_tool_result(ev['name'], ev['result'])
+                elif ev['type'] == 'tool_result': ui.print_tool_result(ev['name'])
                 elif ev['type'] == 'context_compacted':
                     # 压缩重写了 messages，立刻写一份完整快照（含摘要请求原文）
                     log.on_compaction(ev)

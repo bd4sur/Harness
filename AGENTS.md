@@ -11,15 +11,12 @@ Harness 是一个轻量级的**命令行 Agent 框架**，把 OpenAI 兼容的�
 - **Agent 循环**：模型可以在一次任务中反复调用工具，直到自行判断完成。
 - **会话持久化**：对话按运行时间写入 `sessions/session_<时间戳>.jsonl`，包括系统提示词与请求的固定部分（模型名、`max_tokens`、工具 schema），最终发给模型的上下文可从该文件完整还原。
 - **上下文压缩**：当对话轮数超过阈值，自动用模型对历史进行摘要，避免 token 无限增长。
-- **斜杠指令与 Skills**：用户可以输入 `/` 开头的本地命令，也可以动态加载 `skills/` 目录下的 Markdown 文件到系统提示词。
 
 ## 文件结构
 
 ```
 /mnt/d/Desktop/repos/Harness/
-├── harness.py          # 整个项目的唯一入口，包含 LLM、Agent、工具、命令、CLI 五部分
-├── skills/
-│   └── grilling.md     # 示例 skill：通过“拷问式”提问帮用户完善计划
+├── harness.py          # 整个项目的唯一入口，包含 LLM、Agent、工具、TUI、CLI 五部分
 ├── sessions/           # 运行时自动创建，保存对话历史（JSON Lines）
 └── AGENTS.md           # 本说明文档
 ```
@@ -65,21 +62,6 @@ Harness 只提供 4 个最基础的工具，覆盖“读、写、改、验证”
 
 > **安全提示**：`run_bash` 会弹出现场确认，避免模型在无人干预时直接运行危险命令。其它文件工具则直接执行，因此建议在受信任的工作目录中使用。
 
-## 斜杠指令与 Skills
-
-以 `/` 开头的输入会由本地解析执行，**不会发送给 LLM**，也不会写入会话历史。
-
-| 指令 | 作用 |
-|---|---|
-| `/help` | 显示可用指令 |
-| `/skills` | 列出 `skills/` 目录下可用的 skill |
-| `/skill <name>` | 显式加载 `skills/<name>.md` 并追加到 system prompt |
-| `/<name>` | 未注册的内置指令默认当作 skill 名，等价于 `/skill <name>` |
-
-Skill 文件使用 Markdown 格式，顶部可用 `---` 包裹 YAML frontmatter（如 `name`、`description`），加载时 frontmatter 会被自动剔除，正文追加进系统提示词。
-
-仓库自带的 `grilling` skill 会让 Agent 进入“设计树拷问”模式：通过多轮问答帮用户把想法和决策逐层展开，直到没有未解决的隐含假设。
-
 ## 会话与上下文
 
 - 每次启动时，Harness 会加载最近生成的 `sessions/session_*.jsonl` 文件（如果存在），作为初始历史。
@@ -95,7 +77,7 @@ Skill 文件使用 Markdown 格式，顶部可用 `---` 包裹 YAML frontmatter�
 |---|---|---|
 | 消息 | `{"role": ..., "content": ...}` | 与 `context['messages']` 中的一条消息一一对应（assistant 的 `tool_calls`、tool 的 `tool_result` 均在 `content` 旁边原样保存） |
 | `meta` | `{"type": "meta", "model", "base_url", "max_tokens", "stream", "tools", "started_at"}` | 请求的固定部分：启动时写一次，含全部工具 schema |
-| `system_prompt` | `{"type": "system_prompt", "content": ...}` | 系统提示词**全文**；启动时写一次，之后每次变化（如 `/skill` 追加）都写一份新的 |
+| `system_prompt` | `{"type": "system_prompt", "content": ...}` | 系统提示词**全文**；启动时写一次 |
 | `snapshot` | `{"type": "snapshot", "reason", "messages", ...}` | 上下文被重写（压缩）后的**完整**消息列表；压缩时还带 `dropped`、`kept` 与 `summary_request`（压缩时额外发给模型的摘要请求原文） |
 | `usage` | `{"type": "usage", "prompt_tokens", "cached_tokens", "completion_tokens"}` | 每次请求的 token 用量，`cached_tokens` 是命中前缀缓存的 prompt 部分 |
 
@@ -126,19 +108,13 @@ Skill 文件使用 Markdown 格式，顶部可用 `---` 包裹 YAML frontmatter�
    - 定义 `AgentTool` 数据结构并实现 4 个内置工具。
    - 命令输出超过 5000 行时，会写入临时文件并只返回末尾内容；临时文件按**内容哈希**命名（不是 pid/序号），保证同样的输出得到同样的工具结果字符串，跨会话也能复用前缀缓存。
 
-4. **命令层（`src/commands.py`）**
-   - 解析以 `/` 开头的输入。
-   - 维护内置指令注册表，未知指令回退为 skill 加载。
-
-5. **CLI/TUI 层（`src/cli.py` + `src/tui.py`）**
+4. **CLI/TUI 层（`src/cli.py` + `src/tui.py`）**
    - `Tui` 负责把流式事件渲染到终端，包括普通文本、推理文本（显示为 `[思考: ...]`）、工具调用与结果。
    - `cli.py` 是程序入口，负责配置模型、加载会话、启动交互循环。
 
 ## 扩展与开发建议
 
 - **增加工具**：在 `builtin_tools()` 中新增 `AgentTool(name, description, parameters, execute)`，并在工具描述里说明参数。
-- **增加指令**：在 `builtin_commands()` 注册新的 handler，接收 `(args, context)` 并返回展示文本。
-- **增加 Skill**：在 `skills/` 目录新建 `<name>.md`，内容会作为额外系统提示追加。
 - **修改提示词**：调整 `cli.py` 中的 `SYSTEM_PROMPT`。它必须保持为**常量**：不能写入时间、`cwd`、主机名等每次启动都会变的内容，否则服务端前缀缓存从 system 开头就失效；需要环境信息时，让模型自己用 `run_bash` 去查（提示词里已经列出了对应的命令）。
 - **改前缀缓存策略**：消息只能**追加**，不能修改已发出的历史（唯一合法例外是压缩）；压缩（`snapshot`）会把缓存从头废掉，所以 `COMPACT_THRESHOLD` 不要设得太小。命中率看每回合的 `[cache N%]` 输出或 session 里的 `usage` 记录。
 - **调试 API 问题**：可以先通过 `curl` 直接测试 `HARNESS_BASE_URL` 是否支持 OpenAI 兼容的 `/chat/completions` 流式接口。
