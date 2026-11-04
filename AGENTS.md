@@ -40,7 +40,6 @@ python harness.py
 | `HARNESS_BASE_URL` | OpenAI 兼容 API 的基础 URL | `http://192.168.10.50:8888/v1` |
 | `HARNESS_MAX_TOKENS` | 每次请求的最大生成 token 数 | `1048576` |
 | `HARNESS_SESSION` | 会话文件路径。不设则续接 `sessions/` 里最新的一份（不存在则新建）；设为 `none` 强制新开会话；设为某个路径则读写该文件 | 续接最新 |
-| `HARNESS_REASONING_ECHO` | 思考过程回传策略：`off` / `tool_calls` / `all`。DeepSeek 的 thinking 模型在工具续写时、Kimi 的保留式思考在多轮对话时都要求把 `reasoning_content` 原样放回 assistant 消息，否则报 400 或推理链断裂 | `tool_calls` |
 
 示例：
 
@@ -148,7 +147,7 @@ Harness 只提供 4 个最基础的工具，覆盖“读、写、改、验证”
 
 4. **前缀缓存的三条前提**（命中率看 `[cache N%]`）
    - 系统提示词必须是常量，不能含时间、`cwd`、主机名；要环境信息就让模型自己 `run_bash` 去查。
-   - 历史只能追加；`reasoning_content` 回传永远拼在历史末尾（`HARNESS_REASONING_ECHO`），不改已有前缀。
+   - 历史只能追加；`reasoning_content` **全部回传**、无开关，但只拼在历史末尾，不改已有前缀。
    - 工具结果字符串必须确定性：截断输出按**内容哈希**命名临时文件，而不是 pid/序号，否则同一段输出每次都是新字符串，跨会话缓存永远无法复用。
 
 5. **`tool_calls` 是流式增量拼接的**

@@ -16,12 +16,6 @@ class Model:
     base_url: str = 'http://192.168.10.50:8888/v1'
     max_tokens: Optional[int] = None
 
-# 思考内容（reasoning_content）回传策略。DeepSeek / Kimi 的 thinking 模型在多轮对话尤其
-# 工具续写时要求把上一次的 reasoning_content 原样放回 assistant 消息，否则报 400 或推理链断裂。
-# off：不回传；tool_calls：只在发起工具调用的那条 assistant 上回传（默认，token 最省）；all：全部回传。
-# 回传内容永远追加在历史末尾，不修改已有前缀，因此不会破坏前缀缓存。
-REASONING_ECHO = os.environ.get('HARNESS_REASONING_ECHO', 'tool_calls')
-
 def context_to_openai_messages(context: dict) -> list[dict]:
     messages = []
     if context.get('system_prompt'):
@@ -46,7 +40,7 @@ def context_to_openai_messages(context: dict) -> list[dict]:
                     'id': tc['id'], 'type': 'function',
                     'function': {'name': tc['name'], 'arguments': json.dumps(tc.get('args', {}), ensure_ascii=False)}
                 } for tc in raw_tool_calls]
-            # thinking 模型需要把上一轮的思考过程原样带回去（见 REASONING_ECHO）
+            # thinking 模型需要把上一轮的思考过程原样带回去
             if msg.get('reasoning_content'):
                 out['reasoning_content'] = msg['reasoning_content']
             messages.append(out)
@@ -172,7 +166,9 @@ def build_assistant_message(text: str, tool_calls: list[dict], reasoning: str = 
     msg = {'role': 'assistant', 'content': text}
     if tool_calls:
         msg['tool_calls'] = tool_calls
-    if reasoning and (REASONING_ECHO == 'all' or (REASONING_ECHO == 'tool_calls' and tool_calls)):
+    # DeepSeek / Kimi 的 thinking 模型要求把上一轮的 reasoning_content 原样放回 assistant 消息，
+    # 否则报 400 或推理链断裂。全部回传，不给旋钮；回传内容只追加在历史末尾，不改前缀缓存。
+    if reasoning:
         msg['reasoning_content'] = reasoning
     return msg
 
