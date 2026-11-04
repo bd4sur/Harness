@@ -219,7 +219,7 @@ class AgentTool:
 COMPACT_THRESHOLD = 50
 KEEP_RECENT = 20
 
-def compact_context(model: Model, context: dict, signal: Any = None):
+def compact_context(model: Model, context: dict, signal: Any = None, before_request: Any = None):
     if (signal and signal.aborted) or len(context.get('messages', [])) < COMPACT_THRESHOLD:
         return
 
@@ -249,23 +249,41 @@ def compact_context(model: Model, context: dict, signal: Any = None):
     }
 
     summary, failed = '', False
+    # 发请求前先让上层把当前上下文刷到磁盘（压缩前的状态同样需要在 session 里可见）
+    if before_request: before_request(context)
     for ev in stream(model, summary_ctx, signal=signal):
         if ev['type'] == 'text_delta': summary += ev['delta']
         elif ev['type'] == 'error' or (ev['type'] == 'done' and ev['stop_reason'] == 'aborted'):
             failed = True; break
 
     if not failed and summary:
-        context['messages'] = [{'role': 'user', 'content': f'[context summary]\n{summary}'}] + recent_msgs
+        new_messages = [{'role': 'user', 'content': f'[context summary]\n{summary}'}] + recent_msgs
+        context['messages'] = new_messages
+        # 压缩是一次“上下文重写”：早期消息被摘要取代，消息列表整体改变。
+        # 返回详情，让调用方把重写后的完整上下文写进 session，
+        # 否则 jsonl 会与真正发给模型的 messages 脱节（增量追加也无法表达删除）。
+        return {
+            'dropped': len(old_msgs),
+            'kept': len(recent_msgs),
+            'messages': [dict(m) for m in new_messages],
+            'summary_request': json.loads(json.dumps(summary_ctx, ensure_ascii=False)),
+        }
+    return None
 
-def run_agent(model: Model, context: dict, tools: list[AgentTool], signal: Any = None) -> Generator[dict, None, None]:
+def run_agent(model: Model, context: dict, tools: list[AgentTool], signal: Any = None, before_request: Any = None) -> Generator[dict, None, None]:
+    """before_request：每次真正调用模型前回调一次，用于把上下文落盘（保证 jsonl 不缺内容）。"""
     tool_map = {t.name: t for t in tools}
     tool_defs = [{'name': t.name, 'description': t.description, 'parameters': t.parameters} for t in tools]
 
     while True:
-        compact_context(model, context, signal)
+        compact_info = compact_context(model, context, signal, before_request)
+        if compact_info:
+            # 把“上下文被重写”这件事抛给上层，由上层原样落盘到 session。
+            yield {'type': 'context_compacted', **compact_info}
         text, stop_reason, tool_calls = '', 'end_turn', []
 
         try:
+            if before_request: before_request(context)   # 发请求前先把上下文写入 session
             for ev in stream(model, context, tools=tool_defs, signal=signal):
                 if ev['type'] == 'text_delta':
                     text += ev['delta']
@@ -430,6 +448,7 @@ class Tui:
     # ANSI 样式：斜体青色用于思考过程，黄色用于工具调用信息，重置用于恢复默认。
     REASONING_STYLE = '\033[3;36m'
     TOOL_STYLE = '\033[1;33m'
+    NOTICE_STYLE = '\033[2m'
     RESET = '\033[0m'
 
     def __init__(self):
@@ -466,6 +485,11 @@ class Tui:
     def print_turn_end(self):
         self._end_reasoning()
         sys.stdout.write('\n')
+        sys.stdout.flush()
+
+    def print_notice(self, text: str):
+        self._end_reasoning()
+        sys.stdout.write(f'{self.NOTICE_STYLE}{text}\n{self.RESET}')
         sys.stdout.flush()
 
 
@@ -622,15 +646,100 @@ SYSTEM_PROMPT = f"""你是一个严谨的本地编码助手。
 class Signal:
     def __init__(self): self.aborted = False
 
-def load_session() -> list[dict]:
-    if not os.path.exists(SESSION_FILE): return []
-    messages = []
+def load_session() -> tuple[list[dict], Optional[str]]:
+    """从 session jsonl 重建上下文。
+
+    返回 (messages, system_prompt)。记录类型见下方 SessionLog 的说明：
+    普通消息按顺序追加，snapshot 记录表示上下文重写（压缩）需要整份替换。
+    """
+    if not os.path.exists(SESSION_FILE): return [], None
+    messages: list[dict] = []
+    system_prompt = None
     with open(SESSION_FILE, 'r', encoding='utf-8') as f:
         for line in f:
-            if line.strip():
-                try: messages.append(json.loads(line))
-                except: pass
-    return messages
+            line = line.strip()
+            if not line: continue
+            try: rec = json.loads(line)
+            except json.JSONDecodeError: continue
+            if not isinstance(rec, dict): continue
+            if 'role' in rec:                      # 普通消息记录
+                messages.append(rec)
+            elif rec.get('type') == 'snapshot':    # 上下文重写点：整份替换
+                messages = rec.get('messages', [])
+            elif rec.get('type') == 'system_prompt':
+                system_prompt = rec.get('content')
+            # meta 等记录仅用于审计，不参与上下文重建
+    return messages, system_prompt
+
+# session jsonl 记录类型（每行一个 JSON 对象）：
+#   {"role": ...}                                   普通消息，与发给模型的 message 一一对应
+#   {"type": "meta", ...}                            请求的固定部分：模型名 / base_url / max_tokens / 工具 schema
+#   {"type": "system_prompt", "content": ...}       完整系统提示词；每次变化（如 /skill）都重新写一份全文
+#   {"type": "snapshot", "messages": [...]}         上下文被重写（压缩）后的完整消息列表
+#   {"type": "snapshot", "summary_request": ...}    压缩时额外发给模型的摘要请求，也一并留痕
+# 原则：凡是发给模型的上下文（system、messages、tools、max_tokens）都必须能在本文件里找到，
+#      按行读回的顺序即真实上下文顺序。
+
+class SessionLog:
+    """负责把内存里的 context 完整、增量地写进 session jsonl。"""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.message_cursor = 0      # context['messages'] 中已落盘的前缀长度
+        self.system_prompt = None    # 已落盘的系统提示词
+
+    def append(self, record: dict):
+        os.makedirs(os.path.dirname(self.path) or '.', exist_ok=True)
+        with open(self.path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(record, ensure_ascii=False) + '\n')
+
+    def start(self, model: Model, tools: list[AgentTool], context: dict):
+        """刚启动时：先落盘请求的固定部分与系统提示词，再发任何请求。"""
+        self.append({
+            'type': 'meta',
+            'started_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'model': model.model,
+            'base_url': model.base_url,
+            'max_tokens': model.max_tokens,
+            'stream': True,
+            'tools': [{'name': t.name, 'description': t.description, 'parameters': t.parameters} for t in tools],
+        })
+        self.sync_system_prompt(context)
+
+    def sync_system_prompt(self, context: dict):
+        """系统提示词有变动（初始化、/skill 追加）就写一份完整全文。"""
+        prompt = context.get('system_prompt') or ''
+        if prompt and prompt != self.system_prompt:
+            self.system_prompt = prompt
+            self.append({'type': 'system_prompt', 'content': prompt})
+
+    def sync(self, context: dict):
+        """把当前 context 完整刷到文件（系统提示词 + 新增消息）。"""
+        self.sync_system_prompt(context)
+        self.sync_messages(context)
+
+    def sync_messages(self, context: dict):
+        """把新增的消息追加到文件；若发现上下文被意外重写则整份快照。"""
+        messages = context['messages']
+        if len(messages) < self.message_cursor:
+            self.append({'type': 'snapshot', 'reason': 'rewritten', 'messages': messages})
+            self.message_cursor = len(messages)
+            return
+        for msg in messages[self.message_cursor:]:
+            self.append(msg)
+        self.message_cursor = len(messages)
+
+    def on_compaction(self, ev: dict):
+        """上下文压缩：写完整快照 + 摘要请求全文，重置增量游标。"""
+        self.append({
+            'type': 'snapshot',
+            'reason': 'compaction',
+            'dropped': ev['dropped'],
+            'kept': ev['kept'],
+            'summary_request': ev['summary_request'],
+            'messages': ev['messages'],
+        })
+        self.message_cursor = len(ev['messages'])
 
 def main():
     api_key = os.environ.get('HARNESS_API_KEY')
@@ -645,10 +754,13 @@ def main():
         max_tokens=int(os.environ.get('HARNESS_MAX_TOKENS', '65536'))
     )
 
-    context = {'system_prompt': SYSTEM_PROMPT, 'messages': load_session()}
-    persisted_count = len(context['messages'])
+    restored_messages, restored_prompt = load_session()
+    context = {'system_prompt': restored_prompt or SYSTEM_PROMPT, 'messages': restored_messages}
     tools_list = builtin_tools()
     ui = Tui()
+    log = SessionLog(SESSION_FILE)
+    log.start(model, tools_list, context)   # 先把 meta / system prompt 落盘，再发任何请求
+    flush_context = log.sync                # 每次调用模型前先落盘，保证 jsonl 不缺上下文
 
     print("Agent 已启动 (输入 Ctrl+C 可随时中断当前任务，连续两次 Ctrl+C 退出程序)")
     print("多行输入以空行结束；空行本身不会保留。")
@@ -666,6 +778,8 @@ def main():
         result = handle_command(first_line, context)
         if result is not None:
             if result: print(result)
+            # /skill 会改动系统提示词，改动同样属于“发给模型的上下文”，必须落盘
+            log.sync_system_prompt(context)
             continue
 
         # 多行输入：空行结束。后续行用 ': ' 提示。
@@ -684,14 +798,19 @@ def main():
             continue
 
         context['messages'].append({'role': 'user', 'content': text})
+        log.sync_messages(context)   # 先把 user 消息落盘，避免中途崩掉时上下文缺尾巴
 
         signal = Signal()
         try:
-            for ev in run_agent(model, context, tools_list, signal):
+            for ev in run_agent(model, context, tools_list, signal, before_request=flush_context):
                 if ev['type'] == 'assistant_text': ui.print_text(ev['delta'])
                 elif ev['type'] == 'reasoning_text': ui.print_reasoning(ev['delta'])
                 elif ev['type'] == 'tool_call': ui.print_tool_call(ev['name'], ev['args'])
                 elif ev['type'] == 'tool_result': ui.print_tool_result(ev['name'], ev['result'])
+                elif ev['type'] == 'context_compacted':
+                    # 压缩重写了 messages，立刻写一份完整快照（含摘要请求原文）
+                    log.on_compaction(ev)
+                    ui.print_notice(f"[context compacted] dropped {ev['dropped']} messages, kept {ev['kept']}")
                 elif ev['type'] == 'turn_end':
                     if ev['stop_reason'] == 'max_tokens': ui.print_text('\n[output truncated by max_tokens]')
                     if ev['stop_reason'] == 'error': ui.print_text('\n[error occurred]')
@@ -700,11 +819,8 @@ def main():
             signal.aborted = True
             print('\n[aborted by user]')
 
-        os.makedirs(SESSION_DIR, exist_ok=True)
-        with open(SESSION_FILE, 'a', encoding='utf-8') as f:
-            for msg in context['messages'][persisted_count:]:
-                f.write(json.dumps(msg, ensure_ascii=False) + '\n')
-        persisted_count = len(context['messages'])
+        # 本回合遗留的上下文（含中断 / 错误路径）再刷一遍，幂等
+        log.sync(context)
 
 if __name__ == '__main__':
     main()

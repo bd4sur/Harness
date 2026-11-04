@@ -9,7 +9,7 @@ Harness 是一个轻量级的**命令行 Agent 框架**，把 OpenAI 兼容的�
 - **流式对话**：实时显示模型返回的文本与推理过程。
 - **工具调用**：支持读文件、写文件、精确编辑文件、执行 Shell 命令。
 - **Agent 循环**：模型可以在一次任务中反复调用工具，直到自行判断完成。
-- **会话持久化**：对话按运行时间写入 `sessions/session_<时间戳>.jsonl`。
+- **会话持久化**：对话按运行时间写入 `sessions/session_<时间戳>.jsonl`，包括系统提示词与请求的固定部分（模型名、`max_tokens`、工具 schema），最终发给模型的上下文可从该文件完整还原。
 - **上下文压缩**：当对话轮数超过阈值，自动用模型对历史进行摘要，避免 token 无限增长。
 - **斜杠指令与 Skills**：用户可以输入 `/` 开头的本地命令，也可以动态加载 `skills/` 目录下的 Markdown 文件到系统提示词。
 
@@ -85,6 +85,25 @@ Skill 文件使用 Markdown 格式，顶部可用 `---` 包裹 YAML frontmatter�
 - 新的对话会增量追加到同一个会话文件中。
 - 当历史消息数超过 `COMPACT_THRESHOLD`（默认 50 条）时，Agent 会调用一次 LLM 对早期对话做摘要，仅保留最近的 `KEEP_RECENT`（默认 20 条）原始消息，从而控制上下文长度。
 - 摘要时如果保留的最近消息以 `tool` 结果开头，`compact_context` 会向前扩展，把产生该 tool 的 `assistant` 消息一并保留，避免 OpenAI 兼容 API 因 tool 消息前缺少对应 `tool_calls` 而报 400。
+
+### session jsonl 记录格式
+
+**原则：凡是发给模型的上下文（system prompt、messages、tools、max_tokens、model）都必须能在 session 文件里找到，按行读回即为真实上下文顺序。** 文件每行一个 JSON 对象，共四种记录：
+
+| 记录 | 形态 | 含义 |
+|---|---|---|
+| 消息 | `{"role": ..., "content": ...}` | 与 `context['messages']` 中的一条消息一一对应（assistant 的 `tool_calls`、tool 的 `tool_result` 均在 `content` 旁边原样保存） |
+| `meta` | `{"type": "meta", "model", "base_url", "max_tokens", "stream", "tools", "started_at"}` | 请求的固定部分：启动时写一次，含全部工具 schema |
+| `system_prompt` | `{"type": "system_prompt", "content": ...}` | 系统提示词**全文**；启动时写一次，之后每次变化（如 `/skill` 追加）都写一份新的 |
+| `snapshot` | `{"type": "snapshot", "reason", "messages", ...}` | 上下文被重写（压缩）后的**完整**消息列表；压缩时还带 `dropped`、`kept` 与 `summary_request`（压缩时额外发给模型的摘要请求原文） |
+
+写入时机保证「先落盘、后请求」：
+
+- 启动时先写 `meta` + `system_prompt`，再发任何请求。
+- `run_agent` 每次调用模型前都会通过 `before_request` 回调把当前 context 刷入文件，因此会话中途的每一次请求都能在文件里对上号。
+- 用户消息落盘后再请求；压缩（上下文重写）时立刻写 `snapshot` 并重置增量游标。
+- 读回（`load_session`）时：消息记录按序追加，`snapshot` 记录整份替换 `messages`，最后一条 `system_prompt` 作为当前系统提示词；`meta` 只用于审计。压缩后游标重置，避免了旧实现（`persisted_count` 只增不减）在压缩后不再写盘的问题。
+- 以 `role` 字段区分消息记录与其它记录，因此旧版本（只有纯消息行）的 session 文件仍可正常读取。
 
 ## 主要模块说明
 
