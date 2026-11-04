@@ -42,6 +42,7 @@ python harness.py
 | `HARNESS_MODEL` | 模型名称 | `deepseek-v4-flash-0731` |
 | `HARNESS_BASE_URL` | OpenAI 兼容 API 的基础 URL | `http://192.168.10.50:8888/v1` |
 | `HARNESS_MAX_TOKENS` | 每次请求的最大生成 token 数 | `1048576` |
+| `HARNESS_REASONING_ECHO` | 思考过程回传策略：`off` / `tool_calls` / `all`。DeepSeek 的 thinking 模型在工具续写时、Kimi 的保留式思考在多轮对话时都要求把 `reasoning_content` 原样放回 assistant 消息，否则报 400 或推理链断裂 | `tool_calls` |
 
 示例：
 
@@ -57,10 +58,10 @@ Harness 只提供 4 个最基础的工具，覆盖“读、写、改、验证”
 
 | 工具名 | 功能 | 关键参数 |
 |---|---|---|
-| `read_file` | 读取文件内容，大文件只返回最后 200 行 | `path` |
+| `read_file` | 读取文件内容，超长文件只返回末尾 5000 行 | `path` |
 | `write_file` | 写入/覆盖文件，必要时自动创建父目录 | `path`, `content` |
 | `edit` | 精确替换一段文本，`old_string` 必须唯一匹配 | `path`, `old_string`, `new_string` |
-| `run_bash` | 执行 Shell 命令，执行前需要用户在终端确认；输出保留最后 200 行 | `command` |
+| `run_bash` | 执行 Shell 命令，执行前需要用户在终端确认；输出保留最后 5000 行 | `command` |
 
 > **安全提示**：`run_bash` 会弹出现场确认，避免模型在无人干预时直接运行危险命令。其它文件工具则直接执行，因此建议在受信任的工作目录中使用。
 
@@ -88,7 +89,7 @@ Skill 文件使用 Markdown 格式，顶部可用 `---` 包裹 YAML frontmatter�
 
 ### session jsonl 记录格式
 
-**原则：凡是发给模型的上下文（system prompt、messages、tools、max_tokens、model）都必须能在 session 文件里找到，按行读回即为真实上下文顺序。** 文件每行一个 JSON 对象，共四种记录：
+**原则：凡是发给模型的上下文（system prompt、messages、tools、max_tokens、model）都必须能在 session 文件里找到，按行读回即为真实上下文顺序。** 文件每行一个 JSON 对象，共五种记录：
 
 | 记录 | 形态 | 含义 |
 |---|---|---|
@@ -96,6 +97,7 @@ Skill 文件使用 Markdown 格式，顶部可用 `---` 包裹 YAML frontmatter�
 | `meta` | `{"type": "meta", "model", "base_url", "max_tokens", "stream", "tools", "started_at"}` | 请求的固定部分：启动时写一次，含全部工具 schema |
 | `system_prompt` | `{"type": "system_prompt", "content": ...}` | 系统提示词**全文**；启动时写一次，之后每次变化（如 `/skill` 追加）都写一份新的 |
 | `snapshot` | `{"type": "snapshot", "reason", "messages", ...}` | 上下文被重写（压缩）后的**完整**消息列表；压缩时还带 `dropped`、`kept` 与 `summary_request`（压缩时额外发给模型的摘要请求原文） |
+| `usage` | `{"type": "usage", "prompt_tokens", "cached_tokens", "completion_tokens"}` | 每次请求的 token 用量，`cached_tokens` 是命中前缀缓存的 prompt 部分 |
 
 写入时机保证「先落盘、后请求」：
 
@@ -122,7 +124,7 @@ Skill 文件使用 Markdown 格式，顶部可用 `---` 包裹 YAML frontmatter�
 
 3. **工具层（`src/tools.py`）**
    - 定义 `AgentTool` 数据结构并实现 4 个内置工具。
-   - 命令输出超过 200 行时，会写入临时文件并只返回末尾内容。
+   - 命令输出超过 5000 行时，会写入临时文件并只返回末尾内容；临时文件按**内容哈希**命名（不是 pid/序号），保证同样的输出得到同样的工具结果字符串，跨会话也能复用前缀缓存。
 
 4. **命令层（`src/commands.py`）**
    - 解析以 `/` 开头的输入。
@@ -137,7 +139,8 @@ Skill 文件使用 Markdown 格式，顶部可用 `---` 包裹 YAML frontmatter�
 - **增加工具**：在 `builtin_tools()` 中新增 `AgentTool(name, description, parameters, execute)`，并在工具描述里说明参数。
 - **增加指令**：在 `builtin_commands()` 注册新的 handler，接收 `(args, context)` 并返回展示文本。
 - **增加 Skill**：在 `skills/` 目录新建 `<name>.md`，内容会作为额外系统提示追加。
-- **修改提示词**：调整 `cli.py` 中的 `SYSTEM_PROMPT`。
+- **修改提示词**：调整 `cli.py` 中的 `SYSTEM_PROMPT`。它必须保持为**常量**：不能写入时间、`cwd`、主机名等每次启动都会变的内容，否则服务端前缀缓存从 system 开头就失效；需要环境信息时，让模型自己用 `run_bash` 去查（提示词里已经列出了对应的命令）。
+- **改前缀缓存策略**：消息只能**追加**，不能修改已发出的历史（唯一合法例外是压缩）；压缩（`snapshot`）会把缓存从头废掉，所以 `COMPACT_THRESHOLD` 不要设得太小。命中率看每回合的 `[cache N%]` 输出或 session 里的 `usage` 记录。
 - **调试 API 问题**：可以先通过 `curl` 直接测试 `HARNESS_BASE_URL` 是否支持 OpenAI 兼容的 `/chat/completions` 流式接口。
 
 ## 注意事项

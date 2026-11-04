@@ -21,6 +21,12 @@ class Model:
     base_url: str = 'http://192.168.10.50:8888/v1'
     max_tokens: Optional[int] = None
 
+# 思考内容（reasoning_content）回传策略。DeepSeek / Kimi 的 thinking 模型在多轮对话尤其
+# 工具续写时要求把上一次的 reasoning_content 原样放回 assistant 消息，否则报 400 或推理链断裂。
+# off：不回传；tool_calls：只在发起工具调用的那条 assistant 上回传（默认，token 最省）；all：全部回传。
+# 回传内容永远追加在历史末尾，不修改已有前缀，因此不会破坏前缀缓存。
+REASONING_ECHO = os.environ.get('HARNESS_REASONING_ECHO', 'tool_calls')
+
 def context_to_openai_messages(context: dict) -> list[dict]:
     messages = []
     if context.get('system_prompt'):
@@ -56,17 +62,20 @@ def context_to_openai_messages(context: dict) -> list[dict]:
             # OpenAI 兼容 API（如 Kimi）将 content="" 且无 tool_calls 的消息视为无效。
             if not raw_tool_calls and not text:
                 continue
+            out = {'role': 'assistant', 'content': text}
             if raw_tool_calls:
                 # 新格式的内部 tool_calls 需要转成 OpenAI 标准格式
-                tool_calls = raw_tool_calls if raw_tool_calls[0].get('type') == 'function' else [
+                out['content'] = ''
+                out['tool_calls'] = raw_tool_calls if raw_tool_calls[0].get('type') == 'function' else [
                     {
                         'id': tc['id'], 'type': 'function',
                         'function': {'name': tc['name'], 'arguments': json.dumps(tc.get('args', {}), ensure_ascii=False)}
                     } for tc in raw_tool_calls
                 ]
-                messages.append({'role': 'assistant', 'content': '', 'tool_calls': tool_calls})
-            else:
-                messages.append({'role': 'assistant', 'content': text})
+            # thinking 模型需要把上一轮的思考过程原样带回去（见 REASONING_ECHO）
+            if msg.get('reasoning_content'):
+                out['reasoning_content'] = msg['reasoning_content']
+            messages.append(out)
         elif role == 'tool':
             # 标准格式：tool result 以 role='tool' 的 block 列表保存
             for b in content:
@@ -83,7 +92,7 @@ def context_to_openai_messages(context: dict) -> list[dict]:
 
 def stream(model: Model, context: dict, tools: Optional[list[dict]] = None, signal: Any = None) -> Generator[dict, None, None]:
     url = f"{model.base_url}/chat/completions"
-    body: dict[str, Any] = {'model': model.model, 'stream': True, 'messages': context_to_openai_messages(context)}
+    body: dict[str, Any] = {'model': model.model, 'stream': True, 'messages': context_to_openai_messages(context), 'stream_options': {'include_usage': True}}
     if model.max_tokens: body['max_tokens'] = model.max_tokens
     if tools: body['tools'] = [{'type': 'function', 'function': t} for t in tools]
 
@@ -126,7 +135,12 @@ def stream(model: Model, context: dict, tools: Optional[list[dict]] = None, sign
                 try: chunk_json = json.loads(data)
                 except json.JSONDecodeError: continue
 
-                choice = chunk_json.get('choices', [{}])[0]
+                # usage 通常在末尾单独一个 choices 为空的 chunk 里（stream_options.include_usage），
+                # 拿它算前缀缓存命中率：缓存只对“与上次请求相同的前缀”生效。
+                if chunk_json.get('usage'):
+                    yield {'type': 'usage', 'usage': chunk_json['usage']}
+
+                choice = (chunk_json.get('choices') or [{}])[0]
                 if not choice: continue
 
                 delta = choice.get('delta', {})
@@ -153,7 +167,7 @@ def stream(model: Model, context: dict, tools: Optional[list[dict]] = None, sign
                         if 'arguments' in func and func['arguments']: entry['args_buf'] += func['arguments']
 
                 fr = choice.get('finish_reason')
-                if fr == 'tool_calls': stop_reason = 'tool_use'
+                if fr in ('tool_calls', 'function_call'): stop_reason = 'tool_use'
                 elif fr == 'length': stop_reason = 'max_tokens'
                     
     except KeyboardInterrupt:
@@ -184,7 +198,7 @@ def stream(model: Model, context: dict, tools: Optional[list[dict]] = None, sign
 
     yield {'type': 'done', 'stop_reason': 'aborted' if (signal and signal.aborted) else stop_reason}
 
-def build_assistant_message(text: str, tool_calls: list[dict]) -> Optional[dict]:
+def build_assistant_message(text: str, tool_calls: list[dict], reasoning: str = '') -> Optional[dict]:
     # 修复：避免返回 content: []，统一使用简单结构。
     # 当没有文本且没有 tool_calls 时，返回 None，调用方应跳过这条空消息，
     # 避免某些 OpenAI 兼容 API（如 Kimi）把 content="" 且无 tool_calls 的
@@ -195,7 +209,14 @@ def build_assistant_message(text: str, tool_calls: list[dict]) -> Optional[dict]
     msg = {'role': 'assistant', 'content': text}
     if tool_calls:
         msg['tool_calls'] = tool_calls
+    if reasoning and (REASONING_ECHO == 'all' or (REASONING_ECHO == 'tool_calls' and tool_calls)):
+        msg['reasoning_content'] = reasoning
     return msg
+
+def cached_tokens(usage: dict) -> int:
+    """从 usage 里取“命中前缀缓存的 prompt token 数”，兼容 OpenAI / DeepSeek 两种字段。"""
+    details = usage.get('prompt_tokens_details') or {}
+    return details.get('cached_tokens') or usage.get('prompt_cache_hit_tokens') or 0
 
 def build_tool_result_message(results: list[dict]) -> dict:
     return {'role': 'tool', 'content': [{'type': 'tool_result', 'tool_use_id': r['tool_use_id'], 'content': r['content']} for r in results]}
@@ -280,7 +301,7 @@ def run_agent(model: Model, context: dict, tools: list[AgentTool], signal: Any =
         if compact_info:
             # 把“上下文被重写”这件事抛给上层，由上层原样落盘到 session。
             yield {'type': 'context_compacted', **compact_info}
-        text, stop_reason, tool_calls = '', 'end_turn', []
+        text, reasoning, stop_reason, tool_calls = '', '', 'end_turn', []
 
         try:
             if before_request: before_request(context)   # 发请求前先把上下文写入 session
@@ -289,31 +310,34 @@ def run_agent(model: Model, context: dict, tools: list[AgentTool], signal: Any =
                     text += ev['delta']
                     yield {'type': 'assistant_text', 'delta': ev['delta']}
                 elif ev['type'] == 'reasoning_delta':
+                    reasoning += ev['delta']            # 累起来，用于回传给 thinking 模型
                     yield {'type': 'reasoning_text', 'delta': ev['delta']}
+                elif ev['type'] == 'usage':
+                    yield {'type': 'usage', 'usage': ev['usage']}
                 elif ev['type'] == 'tool_call':
                     tool_calls.append({'id': ev['id'], 'name': ev['name'], 'args': ev['args']})
                     yield {'type': 'tool_call', 'id': ev['id'], 'name': ev['name'], 'args': ev['args']}
                 elif ev['type'] == 'done':
                     stop_reason = ev['stop_reason']
                     if stop_reason == 'aborted':
-                        msg = build_assistant_message(text, [])
+                        msg = build_assistant_message(text, [], reasoning)
                         if msg: context['messages'].append(msg)
                         yield {'type': 'turn_end', 'stop_reason': 'aborted'}
                         return
                 elif ev['type'] == 'error':
-                    msg = build_assistant_message(text, [])
+                    msg = build_assistant_message(text, [], reasoning)
                     if msg: context['messages'].append(msg)
                     yield {'type': 'assistant_text', 'delta': f"\n[error] {ev['error']}"}
                     yield {'type': 'turn_end', 'stop_reason': 'error'}
                     return
         except KeyboardInterrupt:
             if signal: signal.aborted = True
-            msg = build_assistant_message(text, [])
+            msg = build_assistant_message(text, [], reasoning)
             if msg: context['messages'].append(msg)
             yield {'type': 'turn_end', 'stop_reason': 'aborted'}
             return
 
-        msg = build_assistant_message(text, tool_calls)
+        msg = build_assistant_message(text, tool_calls, reasoning)
         if msg: context['messages'].append(msg)
 
         if stop_reason == 'max_tokens' and tool_calls:
@@ -357,21 +381,22 @@ def run_agent(model: Model, context: dict, tools: list[AgentTool], signal: Any =
 # 4 个内置工具 —— 能读写改代码并执行验证的最小集。
 # ==========================================
 import os
+import hashlib
 import subprocess
 import sys
 import tempfile
 from typing import Any
 
 MAX_OUTPUT_LINES = 5000
-_truncate_counter = 0
 
 def truncate_output(content: str, max_lines: int = MAX_OUTPUT_LINES) -> str:
     lines = content.split('\n')
     if len(lines) <= max_lines: return content
     kept = '\n'.join(lines[-max_lines:])
-    global _truncate_counter
-    tmp_path = os.path.join(tempfile.gettempdir(), f'nanopi-output-{os.getpid()}-{_truncate_counter}.txt')
-    _truncate_counter += 1
+    # 用内容哈希命名，而不是 pid/计数器：同样的输出必须得到同样的工具结果字符串，
+    # 否则工具结果不确定，跨会话的前缀缓存永远无法复用。
+    digest = hashlib.sha1(content.encode('utf-8')).hexdigest()[:12]
+    tmp_path = os.path.join(tempfile.gettempdir(), f'harness-output-{digest}.txt')
     with open(tmp_path, 'w', encoding='utf-8') as f: f.write(content)
     return f'[output truncated: showing last {max_lines} of {len(lines)} lines. full output: {tmp_path}]\n{kept}'
 
@@ -416,7 +441,7 @@ def builtin_tools() -> list[AgentTool]:
     return [
         AgentTool(
             'read_file',
-            '读取文件内容。参数：path（文件路径）。大文件截取最后 200 行。',
+            '读取文件内容。参数：path（文件路径）。超长文件只返回末尾 5000 行，并给出完整内容的临时文件路径。',
             {'type': 'object', 'properties': {'path': {'type': 'string'}}, 'required': ['path']},
             _read_file),
         AgentTool(
@@ -431,7 +456,7 @@ def builtin_tools() -> list[AgentTool]:
             _edit),
         AgentTool(
             'run_bash',
-            '执行 shell 命令。参数：command（命令字符串）。返回 stdout+stderr，截取最后 200 行。',
+            '执行 shell 命令。参数：command（命令字符串）。返回 stdout+stderr，超长输出只保留末尾 5000 行并给出临时文件路径。',
             {'type': 'object', 'properties': {'command': {'type': 'string'}}, 'required': ['command']},
             _run_bash)
     ]
@@ -491,6 +516,13 @@ class Tui:
         self._end_reasoning()
         sys.stdout.write(f'{self.NOTICE_STYLE}{text}\n{self.RESET}')
         sys.stdout.flush()
+
+    def print_usage(self, usage: dict):
+        """一行缓存命中率：命中数 / prompt 总数，便于判断前缀缓存有没有生效。"""
+        prompt = usage.get('prompt_tokens') or 0
+        hit = cached_tokens(usage)
+        ratio = f'{hit * 100 // prompt}%' if prompt else '-'
+        self.print_notice(f"[cache {ratio}] {hit}/{prompt} prompt tokens reused")
 
 
 # ==========================================
@@ -592,27 +624,26 @@ import os
 import sys
 import json
 import time
-import getpass
-import platform
-import socket
 from datetime import datetime
 
 SESSION_DIR = os.path.join(os.getcwd(), 'sessions')
 SESSION_FILE = os.path.join(SESSION_DIR, f'session_{int(time.time() * 1000)}.jsonl')
-SYSTEM_PROMPT = f"""你是一个严谨的本地编码助手。
-
-当前环境信息：
-- 当前日期时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}（本地时间）
-- 当前工作目录：{os.getcwd()}/
-- 操作系统：{platform.system()} {platform.release()} ({platform.machine()})
-- Python 版本：{platform.python_version()}
-- 主机名：{socket.gethostname()}
-- 当前用户：{getpass.getuser()}
-- HARNESS_MODEL：{os.environ.get('HARNESS_MODEL', '未设置，使用默认值 deepseek-v4-flash-0731')}
-- HARNESS_BASE_URL：{os.environ.get('HARNESS_BASE_URL', '未设置，使用默认值 http://192.168.10.50:8888/v1')}
-- HARNESS_MAX_TOKENS：{os.environ.get('HARNESS_MAX_TOKENS', '未设置，使用默认值 1048576')}
+# 注意：系统提示词必须是常量，不能含时间、路径、主机名等每次启动都会变的内容。
+# 服务端前缀缓存按“逐 token 相同的前缀”命中，头部一变整段缓存全废；
+# 需要环境信息时让模型自己调 run_bash 去查（见下方“环境信息”）。
+SYSTEM_PROMPT = """你是一个严谨的本地编码助手。
 
 你的目标：通过工具与用户协作，高质量完成代码相关任务。
+
+环境信息：
+你不掌握任何运行环境的先验事实（当前时间、工作目录、操作系统版本等），
+需要时一律用 run_bash 现查，不要拍脑袋假设：
+- 当前时间 / 时区：date、date -Iseconds
+- 当前工作目录：pwd
+- 操作系统 / 架构：uname -a、cat /etc/os-release
+- 用户 / 主机名：whoami、hostname
+- Python 解释器版本：python3 -V、which python3
+- 本程序的模型配置：echo $HARNESS_MODEL $HARNESS_BASE_URL $HARNESS_MAX_TOKENS
 
 核心工作流（必须遵守）：
 1. 先读：修改任何文件前，先用 read_file 读取目标文件和相关上下文。
@@ -622,7 +653,7 @@ SYSTEM_PROMPT = f"""你是一个严谨的本地编码助手。
 5. 汇报：用一句话总结本回合做了什么、验证结果如何。
 
 工具使用规范：
-- read_file：读取文件内容，大文件会自动截断最后若干行。需要更多上下文时可指定具体范围（但目前不支持行号，可读取后自己分析）。
+- read_file：读取文件内容，大文件会自动截断末尾若干行，并给出完整输出的临时文件路径。
 - edit：old_string 必须在文件中唯一存在，替换前请在心里核对 old_string 与文件内容是否完全匹配。
 - write_file：会覆盖原文件，使用前先确认目标不存在或用户明确要求覆盖。
 - run_bash：执行 shell 命令，执行前工具会要求用户确认；请一次性给出正确的命令，避免交互式命令（如 vim、top）。
@@ -811,6 +842,13 @@ def main():
                     # 压缩重写了 messages，立刻写一份完整快照（含摘要请求原文）
                     log.on_compaction(ev)
                     ui.print_notice(f"[context compacted] dropped {ev['dropped']} messages, kept {ev['kept']}")
+                elif ev['type'] == 'usage':
+                    # 缓存观测：命中率接近 0 说明前缀被破坏（典型：系统提示词含时间戳、刚压缩完）
+                    usage = ev['usage']
+                    ui.print_usage(usage)
+                    log.append({'type': 'usage', 'prompt_tokens': usage.get('prompt_tokens'),
+                                'cached_tokens': cached_tokens(usage),
+                                'completion_tokens': usage.get('completion_tokens')})
                 elif ev['type'] == 'turn_end':
                     if ev['stop_reason'] == 'max_tokens': ui.print_text('\n[output truncated by max_tokens]')
                     if ev['stop_reason'] == 'error': ui.print_text('\n[error occurred]')
