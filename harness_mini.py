@@ -5,7 +5,7 @@ import readline
 # src/llm.py
 # 统一 LLM API —— 把 OpenAI Completions SSE 响应解析成四种事件流。只支持 OpenAI 兼容格式。
 # ==========================================
-import json, codecs, urllib.request, urllib.error
+import json, urllib.request, urllib.error
 from typing import Any, Generator, Optional
 from dataclasses import dataclass
 
@@ -49,6 +49,10 @@ def context_to_openai_messages(context: dict) -> list[dict]:
                 messages.append({'role': 'tool', 'tool_call_id': b['tool_use_id'], 'content': b['content']})
     return messages
 
+def _chars(kind: str, text: str) -> Generator[dict, None, None]:
+    """把一段文本拆成逐字符增量事件，让刷新粒度不依赖服务端 delta 的切分方式。"""
+    for ch in text: yield {'type': kind, 'delta': ch}
+
 def stream(model: Model, context: dict, tools: Optional[list[dict]] = None, signal: Any = None) -> Generator[dict, None, None]:
     url = f"{model.base_url}/chat/completions"
     body: dict[str, Any] = {'model': model.model, 'stream': True, 'messages': context_to_openai_messages(context)}
@@ -58,38 +62,19 @@ def stream(model: Model, context: dict, tools: Optional[list[dict]] = None, sign
     headers = {'Content-Type': 'application/json', 'Authorization': f'Bearer {model.api_key}'}
     req = urllib.request.Request(url, data=json.dumps(body, ensure_ascii=False).encode('utf-8'), headers=headers, method='POST')
 
+    tool_call_buffers: dict[int, dict[str, str]] = {}
+    stop_reason = 'end_turn'
     try:
         with urllib.request.urlopen(req) as response:
-            tool_call_buffers: dict[int, dict[str, str]] = {}
-            stop_reason = 'end_turn'
-            buffer = ""
-            decoder = codecs.getincrementaldecoder('utf-8')('ignore')
-
-            while True:
-                # 用户中断：直接收摊，不再把缓冲区里读了一半的 tool_calls 当完整调用抛出去
+            # SSE 是一行一个事件，response 本身就是行迭代器：阻塞读一行、解一行、yield 一个事件。
+            # 不需要增量解码器 + 缓冲区状态机（多字节字符不含 0x0A，按行切永远是完整字符）。
+            for raw in response:
+                # 用户中断：直接收摊，不再把只收到一半的 tool_calls 当完整调用抛出去
                 if signal and signal.aborted:
                     yield {'type': 'done', 'stop_reason': 'aborted'}
                     return
 
-                # 优先消费 buffer 中已有的完整 SSE 行，每次只处理一条。
-                # 原来 `while '\n' in buffer` 会一次性把 read(2048) 读到的多个事件
-                # 全部解析并连续 yield，导致 TUI 在几毫秒内被调用多次，输出看起来
-                # 就是“一大块”。改为每次只 yield 一个事件，让上层控制节奏。
-                if '\n' in buffer:
-                    line, buffer = buffer.split('\n', 1)
-                else:
-                    # 读更小的块，避免一次吞掉多个 SSE 事件。
-                    chunk = response.read(64)
-                    if not chunk:
-                        # 流结束，flush 解码器中可能残留的字节
-                        final = decoder.decode(b'', final=True)
-                        if final: buffer += final
-                        break
-                    # 增量解码：自动处理多字节字符边界，不完整的字节会缓存在 decoder 内部
-                    buffer += decoder.decode(chunk)
-                    continue
-
-                line = line.strip()
+                line = raw.decode('utf-8', 'ignore').strip()
                 if not line.startswith('data: '): continue
                 data = line[6:]
                 if data == '[DONE]': break
@@ -101,16 +86,11 @@ def stream(model: Model, context: dict, tools: Optional[list[dict]] = None, sign
                 if not choice: continue
 
                 delta = choice.get('delta', {})
-                if 'content' in delta and delta['content']:
-                    # 把 content delta 拆成单个字符逐个 yield，提高 TUI 回调频率，
-                    # 避免一个 delta 里包含多个词时一次性整段输出。
-                    for ch in delta['content']:
-                        yield {'type': 'text_delta', 'delta': ch}
-
+                if delta.get('content'):
+                    yield from _chars('text_delta', delta['content'])
                 reasoning = delta.get('reasoning_content') or delta.get('reasoning')
                 if reasoning:
-                    for ch in reasoning:
-                        yield {'type': 'reasoning_delta', 'delta': ch}
+                    yield from _chars('reasoning_delta', reasoning)
 
                 if 'tool_calls' in delta and delta['tool_calls']:
                     for tc in delta['tool_calls']:
@@ -154,19 +134,6 @@ def stream(model: Model, context: dict, tools: Optional[list[dict]] = None, sign
 
     yield {'type': 'done', 'stop_reason': 'aborted' if (signal and signal.aborted) else stop_reason}
 
-def build_assistant_message(text: str, tool_calls: list[dict], reasoning: str = '') -> Optional[dict]:
-    text = text or ''
-    if not text and not tool_calls:      # 空转轮次不写进历史，见 AGENTS.md「已知坑」
-        return None
-    msg = {'role': 'assistant', 'content': text}
-    if tool_calls:
-        msg['tool_calls'] = tool_calls
-    # DeepSeek / Kimi 的 thinking 模型要求把上一轮的 reasoning_content 原样放回 assistant 消息，
-    # 否则报 400 或推理链断裂。
-    if reasoning:
-        msg['reasoning_content'] = reasoning
-    return msg
-
 def build_tool_result_message(results: list[dict]) -> dict:
     return {'role': 'tool', 'content': [{'type': 'tool_result', 'tool_use_id': r['tool_use_id'], 'content': r['content']} for r in results]}
 
@@ -176,6 +143,7 @@ def build_tool_result_message(results: list[dict]) -> dict:
 # Agent Loop —— 整个项目的灵魂：一个 while 循环。
 # ==========================================
 import json
+from types import SimpleNamespace
 from typing import Any, Generator, Callable
 from dataclasses import dataclass
 
@@ -193,21 +161,14 @@ def compact_context(model: Model, context: dict, signal: Any = None):
     if (signal and signal.aborted) or len(context.get('messages', [])) < COMPACT_THRESHOLD:
         return None
 
-    old_msgs = context['messages'][:-KEEP_RECENT]
-    recent_msgs = context['messages'][-KEEP_RECENT:]
-
-    # 摘要可能连发起 tool 的 assistant 一起摘掉，保留段以 tool 开头就缺了它（见 AGENTS.md）
-    while recent_msgs and recent_msgs[0].get('role') == 'tool':
-        idx = len(old_msgs) - 1
-        while idx >= 0 and old_msgs[idx].get('role') != 'assistant':
-            idx -= 1
-        if idx < 0:
-            # 找不到对应的 assistant，丢弃这条孤立的 tool 消息
-            recent_msgs = recent_msgs[1:]
-            continue
-        recent_msgs = old_msgs[idx:] + recent_msgs
-        old_msgs = old_msgs[:idx]
-        break
+    messages = context['messages']
+    cut = len(messages) - KEEP_RECENT
+    if messages[cut]['role'] == 'tool':
+        # 保留段不能以 tool 开头：缺了发起它的 assistant，API 会报 400。退到最近的一条 assistant。
+        cut = next((i for i in range(cut - 1, -1, -1) if messages[i]['role'] == 'assistant'), cut)
+        # 极端情况：整段历史里找不到发起者，就丢掉开头的孤立 tool 消息
+        while cut < len(messages) and messages[cut]['role'] == 'tool': cut += 1
+    old_msgs, recent_msgs = messages[:cut], messages[cut:]
 
     conv_text = '\n'.join([f"{m['role']}: {json.dumps(m['content'], ensure_ascii=False) if isinstance(m['content'], list) else m['content']}" for m in old_msgs])
 
@@ -228,9 +189,17 @@ def compact_context(model: Model, context: dict, signal: Any = None):
     return None
 
 def _append_assistant(context: dict, text: str, tool_calls: list[dict], reasoning: str = ''):
-    """构建 assistant 消息并追加进 context；空消息（既无文本也无 tool_calls）自动跳过。"""
-    msg = build_assistant_message(text, tool_calls, reasoning)
-    if msg: context['messages'].append(msg)
+    """构建 assistant 消息并追加进 context；既无文本也无 tool_calls 的空转轮次不写历史（见 AGENTS.md）。"""
+    if not text and not tool_calls:
+        return
+    msg = {'role': 'assistant', 'content': text or ''}
+    if tool_calls:
+        msg['tool_calls'] = tool_calls
+    # DeepSeek / Kimi 的 thinking 模型要求把上一轮的 reasoning_content 原样放回 assistant 消息，
+    # 否则报 400 或推理链断裂。
+    if reasoning:
+        msg['reasoning_content'] = reasoning
+    context['messages'].append(msg)
 
 def run_agent(model: Model, context: dict, tools: list[AgentTool], signal: Any = None) -> Generator[dict, None, None]:
     tool_map = {t.name: t for t in tools}
@@ -270,13 +239,15 @@ def run_agent(model: Model, context: dict, tools: list[AgentTool], signal: Any =
             yield {'type': 'turn_end', 'stop_reason': 'end_turn' if stop_reason == 'tool_use' else stop_reason}
             return
 
-        # 工具结果统一在这里构造：max_tokens 截断与正常执行只差 content 从哪来，
-        # 收集完 results 后只 append 一次、只上报一遍，不再分两条路径。
+        # 工具结果统一在这里构造：max_tokens 截断、正常执行、已中断三种情况只差 content 从哪来，
+        # 收集完 results 后只 append 一次、只上报一遍。
         truncated = stop_reason == 'max_tokens'
-        results = []
+        results, stop = [], False
         for tc in tool_calls:
             if truncated:
                 res = f'error: output truncated by max_tokens, tool "{tc["name"]}" args may be incomplete.'
+            elif stop:
+                res = 'error: aborted'
             else:
                 tool = tool_map.get(tc['name'])
                 if not tool: res = f'error: tool "{tc["name"]}" not found'
@@ -289,12 +260,7 @@ def run_agent(model: Model, context: dict, tools: list[AgentTool], signal: Any =
 
             results.append({'tool_use_id': tc['id'], 'content': res})
             yield {'type': 'tool_result', 'id': tc['id'], 'name': tc['name'], 'result': res}
-            if signal and signal.aborted: break
-
-        # 中断时补上未执行的 tool_call，保证 tool_calls 与 tool 结果一一对应
-        for tc in tool_calls[len(results):]:
-            results.append({'tool_use_id': tc['id'], 'content': 'error: aborted'})
-            yield {'type': 'tool_result', 'id': tc['id'], 'name': tc['name'], 'result': 'error: aborted'}
+            if signal and signal.aborted: stop = True
 
         context['messages'].append(build_tool_result_message(results))
         if signal and signal.aborted:
@@ -426,51 +392,27 @@ class Tui:
 
 # 注意：系统提示词必须是常量，不能含时间、路径、主机名等每次启动都会变的内容。
 # 需要环境信息时让模型自己调 run_bash 去查（见下方“环境信息”）。
-SYSTEM_PROMPT = """你是一个严谨的本地编码助手。
+SYSTEM_PROMPT = """你是一个严谨的本地编码助手：通过工具与用户协作，高质量完成代码相关任务。
 
-你的目标：通过工具与用户协作，高质量完成代码相关任务。
-
-环境信息：
-你不掌握任何运行环境的先验事实（当前时间、工作目录、操作系统版本等），
-需要时一律用 run_bash 现查，不要拍脑袋假设：
-- 当前时间 / 时区：date、date -Iseconds
-- 当前工作目录：pwd
-- 操作系统 / 架构：uname -a、cat /etc/os-release
-- 用户 / 主机名：whoami、hostname
-- Python 解释器版本：python3 -V、which python3
-- 本程序的模型配置：固化在本脚本 main() 里的常量，不读环境变量
+环境信息：你不掌握任何运行环境的先验事实（时间、工作目录、系统版本等），需要时一律用 run_bash 现查（date、pwd、uname -a、python3 -V、echo $HOME），不要拍脑袋假设。本程序的模型配置固化在 main() 的常量里，不读环境变量。
 
 核心工作流（必须遵守）：
-1. 先读：修改任何文件前，先用 read_file 读取目标文件和相关上下文。
-2. 再计划：简要说明你要做什么、分几步、每步改什么。
-3. 最小修改：优先使用 edit 做精确文本替换；只有新建文件或必须整体重写时，才使用 write_file。
-4. 后验证：修改完成后，必须运行相关命令（测试、编译、lint、运行脚本等）验证结果。
+1. 先读：改任何文件前，先用 read_file 读目标文件与相关上下文。
+2. 再计划：说明要做什么、分几步、每步改什么。
+3. 最小修改：优先 edit 精确替换；只有新建文件或必须整体重写才用 write_file。
+4. 后验证：改完必须跑相关命令（测试、编译、lint、运行脚本）验证结果。
 5. 汇报：用一句话总结本回合做了什么、验证结果如何。
 
-工具使用规范：
-- read_file：读取文件内容，大文件会自动截断末尾若干行，并给出完整输出的临时文件路径。
-- edit：old_string 必须在文件中唯一存在，替换前请在心里核对 old_string 与文件内容是否完全匹配。
-- write_file：会覆盖原文件，使用前先确认目标不存在或用户明确要求覆盖。
-- run_bash：执行 shell 命令，执行前工具会要求用户确认；请一次性给出正确的命令，避免交互式命令（如 vim、top）。
+错误处理：edit 报 old_string 不匹配就先重新 read_file 核对再重试；run_bash 失败先读 stderr，判断是命令问题、环境问题还是预期内错误；不要用同样的参数连续重试同一工具。
 
-错误处理：
-- 如果 edit 报错 old_string 不匹配，先重新 read_file 确认内容，再修正 old_string 重试。
-- 如果 run_bash 返回错误，先分析 stderr，判断是命令问题、环境问题还是预期内错误，再决定下一步。
-- 不要连续多次用同样的参数重试同一工具。
+输出风格：回复简洁、结构化；思考过程用 [Thinking: ...] 展示，对外输出聚焦在行动和结果上。
 
-输出风格：
-- 对用户的回复简洁、结构化，避免长篇大论。
-- 思考过程可以用 [Thinking: ...] 展示，但对外输出要聚焦在行动和结果上。
-- 每轮结束时，用一句话总结当前进度。
-
-安全边界：
-- 不主动删除用户文件。
-- 不执行可能破坏工作目录的命令（rm -rf、重定向覆盖关键文件等）。
-- 需要覆盖或删除时，先征得用户同意。
+安全边界：不主动删除用户文件，不执行可能破坏工作目录的命令（rm -rf、重定向覆盖关键文件等）；需要覆盖或删除时先征得用户同意。
 """
 
-class Signal:
-    def __init__(self): self.aborted = False
+def Signal() -> SimpleNamespace:
+    """只带一个 aborted 标志；Ctrl+C 置位后各层统一收摊。"""
+    return SimpleNamespace(aborted=False)
 
 def main():
     # 配置全部固化在这里，不读任何环境变量。
