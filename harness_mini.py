@@ -3,7 +3,7 @@ import readline
 
 # ==========================================
 # src/llm.py
-# 统一 LLM API —— 把 OpenAI Completions SSE 响应解析成四种事件流。只支持 OpenAI 兼容格式。
+# 统一 LLM API —— 把 OpenAI Completions SSE 响应解析成四种事件流：delta / tool_call / done / error。只支持 OpenAI 兼容格式。
 # ==========================================
 import json, urllib.request, urllib.error
 from typing import Any, Generator, Optional
@@ -49,9 +49,7 @@ def context_to_openai_messages(context: dict) -> list[dict]:
                 messages.append({'role': 'tool', 'tool_call_id': b['tool_use_id'], 'content': b['content']})
     return messages
 
-def _chars(kind: str, text: str) -> Generator[dict, None, None]:
-    """把一段文本拆成逐字符增量事件，让刷新粒度不依赖服务端 delta 的切分方式。"""
-    for ch in text: yield {'type': kind, 'delta': ch}
+STOP_REASONS = {'tool_calls': 'tool_use', 'function_call': 'tool_use', 'length': 'max_tokens'}
 
 def stream(model: Model, context: dict, tools: Optional[list[dict]] = None, signal: Any = None) -> Generator[dict, None, None]:
     url = f"{model.base_url}/chat/completions"
@@ -85,27 +83,21 @@ def stream(model: Model, context: dict, tools: Optional[list[dict]] = None, sign
                 choice = (chunk_json.get('choices') or [{}])[0]
                 if not choice: continue
 
+                # 文本与思考增量统一成一个 delta 事件（channel 区分），整段转发，不逐字拆分
                 delta = choice.get('delta', {})
-                if delta.get('content'):
-                    yield from _chars('text_delta', delta['content'])
-                reasoning = delta.get('reasoning_content') or delta.get('reasoning')
-                if reasoning:
-                    yield from _chars('reasoning_delta', reasoning)
+                for channel, piece in (('text', delta.get('content')),
+                                       ('reasoning', delta.get('reasoning_content') or delta.get('reasoning'))):
+                    if piece: yield {'type': 'delta', 'channel': channel, 'delta': piece}
 
-                if 'tool_calls' in delta and delta['tool_calls']:
-                    for tc in delta['tool_calls']:
-                        idx = tc.get('index', 0)
-                        if idx not in tool_call_buffers:
-                            tool_call_buffers[idx] = {'id': tc.get('id', f'call_{idx}'), 'name': '', 'args_buf': ''}
-                        entry = tool_call_buffers[idx]
-                        if 'id' in tc and tc['id']: entry['id'] = tc['id']
-                        func = tc.get('function', {})
-                        if 'name' in func and func['name']: entry['name'] = func['name']
-                        if 'arguments' in func and func['arguments']: entry['args_buf'] += func['arguments']
+                for tc in delta.get('tool_calls') or []:
+                    idx = tc.get('index', 0)
+                    entry = tool_call_buffers.setdefault(idx, {'id': f'call_{idx}', 'name': '', 'args_buf': ''})
+                    entry['id'] = tc.get('id') or entry['id']
+                    func = tc.get('function') or {}
+                    entry['name'] = func.get('name') or entry['name']
+                    entry['args_buf'] += func.get('arguments') or ''
 
-                fr = choice.get('finish_reason')
-                if fr in ('tool_calls', 'function_call'): stop_reason = 'tool_use'
-                elif fr == 'length': stop_reason = 'max_tokens'
+                stop_reason = STOP_REASONS.get(choice.get('finish_reason'), stop_reason)
 
     except KeyboardInterrupt:
         if signal: signal.aborted = True
@@ -124,12 +116,10 @@ def stream(model: Model, context: dict, tools: Optional[list[dict]] = None, sign
         yield {'type': 'error', 'error': f'HTTP {e.code}: {detail}' if detail else str(e)}
         return
 
-    for idx in sorted(tool_call_buffers.keys()):
+    for idx in sorted(tool_call_buffers):
         tc = tool_call_buffers[idx]
-        args = {}
-        if tc['args_buf']:
-            try: args = json.loads(tc['args_buf'])
-            except: args = {}
+        try: args = json.loads(tc['args_buf'] or '{}')
+        except json.JSONDecodeError: args = {}
         yield {'type': 'tool_call', 'id': tc['id'], 'name': tc['name'], 'args': args}
 
     yield {'type': 'done', 'stop_reason': 'aborted' if (signal and signal.aborted) else stop_reason}
@@ -179,7 +169,7 @@ def compact_context(model: Model, context: dict, signal: Any = None):
 
     summary, failed = '', False
     for ev in stream(model, summary_ctx, signal=signal):
-        if ev['type'] == 'text_delta': summary += ev['delta']
+        if ev['type'] == 'delta' and ev['channel'] == 'text': summary += ev['delta']
         elif ev['type'] == 'error' or (ev['type'] == 'done' and ev['stop_reason'] == 'aborted'):
             failed = True; break
 
@@ -212,12 +202,12 @@ def run_agent(model: Model, context: dict, tools: list[AgentTool], signal: Any =
         text, reasoning, stop_reason, tool_calls = '', '', 'end_turn', []
 
         for ev in stream(model, context, tools=tool_defs, signal=signal):
-            if ev['type'] == 'text_delta':
-                text += ev['delta']
-                yield {'type': 'assistant_text', 'delta': ev['delta']}
-            elif ev['type'] == 'reasoning_delta':
-                reasoning += ev['delta']            # 累起来，用于回传给 thinking 模型
-                yield {'type': 'reasoning_text', 'delta': ev['delta']}
+            if ev['type'] == 'delta':
+                # 思考增量同时累进 reasoning，最后随 assistant 消息回传给 thinking 模型
+                is_reasoning = ev['channel'] == 'reasoning'
+                if is_reasoning: reasoning += ev['delta']
+                else: text += ev['delta']
+                yield {'type': 'reasoning_text' if is_reasoning else 'assistant_text', 'delta': ev['delta']}
             elif ev['type'] == 'tool_call':
                 tool_calls.append({'id': ev['id'], 'name': ev['name'], 'args': ev['args']})
                 yield {'type': 'tool_call', 'id': ev['id'], 'name': ev['name'], 'args': ev['args']}
